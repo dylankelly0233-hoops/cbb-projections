@@ -10,8 +10,7 @@ import io
 st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
-# We use st.secrets for security so your API key isn't public on GitHub
-# If running locally, you can hardcode it, but for web, use secrets (explained below).
+# 1. HARDCODED API KEY (As requested for the quick fix)
 API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
 
 YEAR = 2026
@@ -19,13 +18,11 @@ DECAY_ALPHA = 0.035
 BASE_URL = 'https://api.collegebasketballdata.com'
 HEADERS = {'Authorization': f'Bearer {API_KEY}', 'accept': 'application/json'}
 
-
 # --- HELPER FUNCTIONS ---
 
 def get_team_name(team_obj):
     if isinstance(team_obj, dict): return team_obj.get('name', 'Unknown')
     return str(team_obj)
-
 
 def utc_to_et(iso_date_str):
     if not iso_date_str: return datetime.now()
@@ -36,33 +33,50 @@ def utc_to_et(iso_date_str):
     except ValueError:
         return datetime.now()
 
-
-# We use @st.cache_data so it doesn't spam the API every time you click a button.
-# It refreshes data once every hour (3600 seconds).
+# --- DATA FETCHING WITH DEBUGGING ---
 @st.cache_data(ttl=3600)
 def fetch_api_data(year):
-    with st.spinner('Fetching latest data from API...'):
-        # Fetch Games
-        games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
-        games = games_resp.json() if games_resp.status_code == 200 else []
+    # Debug info visible on the site
+    masked_key = API_KEY[:5] + "..." + API_KEY[-5:] if API_KEY else "None"
+    st.caption(f"🔐 API Key Status: Loaded (Ends in {API_KEY[-5:]})")
+    
+    with st.spinner(f'Fetching data for season {year}...'):
+        # 1. Fetch Games
+        try:
+            games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
+            if games_resp.status_code != 200:
+                st.error(f"❌ API Error (Games): Status {games_resp.status_code}")
+                st.code(games_resp.text) # Show exact server response
+                return [], []
+            games = games_resp.json()
+        except Exception as e:
+            st.error(f"❌ Connection Error (Games): {e}")
+            return [], []
 
-        # Fetch Lines
-        lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year})
-        lines = lines_resp.json() if lines_resp.status_code == 200 else []
-
+        # 2. Fetch Lines
+        try:
+            lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year})
+            if lines_resp.status_code != 200:
+                st.error(f"❌ API Error (Lines): Status {lines_resp.status_code}")
+                return [], []
+            lines = lines_resp.json()
+        except Exception as e:
+            st.error(f"❌ Connection Error (Lines): {e}")
+            return [], []
+        
         return games, lines
-
 
 # --- MAIN LOGIC ---
 
 def run_analysis():
     st.title(f"🏀 CBB Power Ratings & Projections {YEAR}")
-
+    
     # 1. Fetch Data
     games_json, lines_json = fetch_api_data(YEAR)
-
+    
+    # DEBUG: Check if data is empty even if successful
     if not games_json:
-        st.error("Failed to load games data.")
+        st.warning(f"⚠️ API connected, but returned 0 games for Year {YEAR}. Try changing the year.")
         return
 
     # Process Dates
@@ -100,13 +114,13 @@ def run_analysis():
         home = get_team_name(game.get('homeTeam'))
         away = get_team_name(game.get('awayTeam'))
         meta = game_meta.get(f"{home}_{away}")
-
+        
         if not meta: continue
 
         g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
         days_ago = (target_dt_obj - g_date_obj).days
 
-        if days_ago < 0: continue  # Skip future
+        if days_ago < 0: continue # Skip future
 
         weight = np.exp(-DECAY_ALPHA * days_ago)
         matchups.append({
@@ -115,7 +129,7 @@ def run_analysis():
         })
 
     df = pd.DataFrame(matchups)
-
+    
     if df.empty:
         st.warning("No past line data found to train model.")
         return
@@ -145,7 +159,7 @@ def run_analysis():
     ratings_df = pd.DataFrame({'Team': market_ratings.index, 'Rating': market_ratings.values})
     ratings_df = ratings_df.sort_values('Rating', ascending=False).reset_index(drop=True)
     ratings_df.index += 1
-
+    
     st.sidebar.header("Market Settings")
     st.sidebar.metric("Implied HCA", f"{implied_hca:.2f}")
     st.sidebar.info(f"Using Decay Alpha: {DECAY_ALPHA}")
@@ -155,7 +169,7 @@ def run_analysis():
 
     # 6. Projections
     st.subheader(f"Games for {today_str}")
-
+    
     if not todays_games:
         st.info("No games scheduled for today.")
     else:
@@ -165,14 +179,14 @@ def run_analysis():
         for g in todays_games:
             h = get_team_name(g.get('homeTeam'))
             a = get_team_name(g.get('awayTeam'))
-
+            
             h_r = market_ratings.get(h, 0.0)
             a_r = market_ratings.get(a, 0.0)
             is_neutral = g.get('neutralSite', False)
             hca_val = 0.0 if is_neutral else implied_hca
 
             my_line = (h_r - a_r) + hca_val
-
+            
             # Find Vegas line
             gid = g.get('id')
             vegas = None
@@ -181,16 +195,14 @@ def run_analysis():
                     s = l['lines'][0].get('spread')
                     if s is not None: vegas = float(s)
                     break
-
+            
             edge = (my_line - (-vegas)) if vegas is not None else 0
-
+            
             # Formatting for display
             pick = ""
-            if edge > 3.0:
-                pick = f"BET {h}"
-            elif edge < -3.0:
-                pick = f"BET {a}"
-
+            if edge > 3.0: pick = f"BET {h}"
+            elif edge < -3.0: pick = f"BET {a}"
+            
             projections.append({
                 'Time': g['et_datetime'].strftime('%I:%M %p'),
                 'Matchup': f"{a} @ {h}",
@@ -199,14 +211,14 @@ def run_analysis():
                 'Edge': round(edge, 1),
                 'Pick': pick
             })
-
+            
         proj_df = pd.DataFrame(projections)
 
         # Style the dataframe (Highlight Edges)
         def highlight_picks(val):
             color = ''
             if 'BET' in str(val):
-                color = 'background-color: #90EE90; color: black; font-weight: bold'  # Light Green
+                color = 'background-color: #90EE90; color: black; font-weight: bold' # Light Green
             return color
 
         st.dataframe(proj_df.style.applymap(highlight_picks, subset=['Pick']), use_container_width=True)
@@ -216,7 +228,7 @@ def run_analysis():
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             ratings_df.to_excel(writer, sheet_name='Ratings')
             proj_df.to_excel(writer, sheet_name='Projections', index=False)
-
+        
         st.download_button(
             label="📥 Download Excel Report",
             data=buffer.getvalue(),
@@ -224,7 +236,5 @@ def run_analysis():
             mime="application/vnd.ms-excel"
         )
 
-
 if __name__ == "__main__":
-
     run_analysis()
