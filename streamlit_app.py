@@ -11,14 +11,11 @@ st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
 API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
-
 YEAR = 2026
-DECAY_ALPHA = 0.035
 BASE_URL = 'https://api.collegebasketballdata.com'
 HEADERS = {'Authorization': f'Bearer {API_KEY}', 'accept': 'application/json'}
 
 # --- HELPER FUNCTIONS ---
-
 def get_team_name(team_obj):
     if isinstance(team_obj, dict): return team_obj.get('name', 'Unknown')
     return str(team_obj)
@@ -36,14 +33,12 @@ def utc_to_et(iso_date_str):
 @st.cache_data(ttl=3600)
 def fetch_api_data(year):
     masked_key = API_KEY[:5] + "..." + API_KEY[-5:] if API_KEY else "None"
-    st.caption(f"🔐 API Key Status: Loaded (Ends in {API_KEY[-5:]})")
     
     with st.spinner(f'Fetching data for season {year}...'):
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
             if games_resp.status_code != 200:
-                st.error(f"❌ API Error (Games): Status {games_resp.status_code}")
-                st.code(games_resp.text)
+                st.error(f"❌ API Error (Games): {games_resp.status_code}")
                 return [], []
             games = games_resp.json()
         except Exception as e:
@@ -53,7 +48,7 @@ def fetch_api_data(year):
         try:
             lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year})
             if lines_resp.status_code != 200:
-                st.error(f"❌ API Error (Lines): Status {lines_resp.status_code}")
+                st.error(f"❌ API Error (Lines): {lines_resp.status_code}")
                 return [], []
             lines = lines_resp.json()
         except Exception as e:
@@ -63,23 +58,34 @@ def fetch_api_data(year):
         return games, lines
 
 # --- MAIN LOGIC ---
-
 def run_analysis():
-    st.title(f"🏀 CBB Power Ratings & Projections {YEAR}")
+    # --- SIDEBAR CONTROLS ---
+    st.sidebar.title("⚙️ Settings")
     
-    # 1. Fetch Data
+    # 1. Date Selector
+    st.sidebar.subheader("📅 Date Selection")
+    # Default to today
+    now_et = datetime.now(timezone(timedelta(hours=-5)))
+    selected_date = st.sidebar.date_input("Target Date", now_et)
+    today_str = selected_date.strftime('%Y-%m-%d')
+
+    # 2. Decay Setting
+    decay_alpha = st.sidebar.slider("Decay Rate (Alpha)", 0.00, 0.10, 0.035, 0.005)
+    
+    # 3. HCA Logic Toggle
+    st.sidebar.subheader("🏟️ Home Court Logic")
+    use_dynamic_hca = st.sidebar.checkbox("Use Team-Specific HCA", value=False, help="If checked, the model calculates a unique Home Court Advantage for every team. If unchecked, it uses one global average.")
+
+    st.title(f"🏀 CBB Projections: {today_str}")
+
+    # --- 1. FETCH DATA ---
     games_json, lines_json = fetch_api_data(YEAR)
     
     if not games_json:
-        st.warning(f"⚠️ API connected, but returned 0 games for Year {YEAR}. Try changing the year.")
+        st.warning("No data loaded.")
         return
 
-    # Process Dates
-    now_et = datetime.now(timezone(timedelta(hours=-5)))
-    today_str = now_et.strftime('%Y-%m-%d')
-    st.caption(f"Last Updated: {now_et.strftime('%Y-%m-%d %H:%M:%S ET')}")
-
-    # 2. Process Games
+    # --- 2. PROCESS GAMES ---
     todays_games = []
     game_meta = {}
 
@@ -92,11 +98,12 @@ def run_analysis():
 
         game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
 
+        # Filter for the SELECTED date, not just "today"
         if date_et == today_str:
             g['et_datetime'] = dt_et
             todays_games.append(g)
 
-    # 3. Build Training Matrix
+    # --- 3. BUILD TRAINING MATRIX ---
     matchups = []
     target_dt_obj = datetime.strptime(today_str, '%Y-%m-%d')
 
@@ -112,12 +119,16 @@ def run_analysis():
         
         if not meta: continue
 
+        # "Time Travel" Logic:
+        # Calculate days ago relative to the USER SELECTED date.
         g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
         days_ago = (target_dt_obj - g_date_obj).days
 
-        if days_ago < 0: continue
+        # STRICT RULE: Do not use games that haven't happened yet relative to the selected date
+        if days_ago < 0: continue 
 
-        weight = np.exp(-DECAY_ALPHA * days_ago)
+        weight = np.exp(-decay_alpha * days_ago)
+        
         matchups.append({
             'Home': home, 'Away': away, 'Margin': -1 * float(s),
             'Is_Neutral': meta['is_neutral'], 'Weight': weight
@@ -126,47 +137,86 @@ def run_analysis():
     df = pd.DataFrame(matchups)
     
     if df.empty:
-        st.warning("No past line data found to train model.")
+        st.error(f"No past games found prior to {today_str} to train the model.")
         return
 
-    # 4. Regression
+    # --- 4. REGRESSION (THE SMART PART) ---
+    # Create Team Dummies (1 for Home, -1 for Away)
     home_dummies = pd.get_dummies(df['Home'], dtype=int)
     away_dummies = pd.get_dummies(df['Away'], dtype=int)
     all_teams = sorted(list(set(home_dummies.columns) | set(away_dummies.columns)))
 
+    # Align columns
     home_dummies = home_dummies.reindex(columns=all_teams, fill_value=0)
     away_dummies = away_dummies.reindex(columns=all_teams, fill_value=0)
 
-    X = home_dummies.sub(away_dummies)
-    X['HFA_Constant'] = df['Is_Neutral'].apply(lambda x: 0 if x else 1)
+    # Base Matrix: Home - Away
+    X_ratings = home_dummies.sub(away_dummies)
+
+    if use_dynamic_hca:
+        # COMPLEX METHOD: Add a column for every team representing their specific HCA
+        # We only mark it as '1' if they are the Home Team AND it's not neutral
+        X_hca = home_dummies.copy()
+        # Zero out rows where it was a neutral site
+        is_neutral_mask = df['Is_Neutral'].values
+        X_hca.loc[is_neutral_mask, :] = 0
+        
+        # Rename columns to avoid collision
+        X_hca.columns = [f"{c}_HCA" for c in X_hca.columns]
+        
+        # Combine Ratings + HCA columns
+        X = pd.concat([X_ratings, X_hca], axis=1)
+    else:
+        # SIMPLE METHOD: One single column for HCA
+        X = X_ratings.copy()
+        X['HFA_Constant'] = df['Is_Neutral'].apply(lambda x: 0 if x else 1)
+
     y = df['Margin']
     w_vals = df['Weight'].values
     w_norm = w_vals * (len(w_vals) / w_vals.sum())
 
-    clf = Ridge(alpha=0.001, fit_intercept=False)
+    # Ridge Regression
+    clf = Ridge(alpha=1.0, fit_intercept=False) # Increased alpha slightly for stability
     clf.fit(X, y, sample_weight=w_norm)
 
+    # --- 5. EXTRACT RATINGS ---
     coefs = pd.Series(clf.coef_, index=X.columns)
-    implied_hca = coefs['HFA_Constant']
-    market_ratings = coefs.drop('HFA_Constant') - coefs.drop('HFA_Constant').mean()
+    
+    if use_dynamic_hca:
+        # Split coefficients into Ratings and HCA
+        rating_cols = [c for c in coefs.index if not c.endswith('_HCA')]
+        hca_cols = [c for c in coefs.index if c.endswith('_HCA')]
+        
+        raw_ratings = coefs[rating_cols]
+        hca_vals = coefs[hca_cols]
+        # Clean HCA index names
+        hca_vals.index = [c.replace('_HCA', '') for c in hca_vals.index]
+        
+        # Center ratings
+        market_ratings = raw_ratings - raw_ratings.mean()
+        
+        # Calculate Average HCA for display
+        avg_hca = hca_vals.mean()
+        st.sidebar.info(f"Avg Dynamic HCA: {avg_hca:.2f} pts")
+        
+    else:
+        implied_hca = coefs['HFA_Constant']
+        market_ratings = coefs.drop('HFA_Constant') - coefs.drop('HFA_Constant').mean()
+        st.sidebar.info(f"Global Fixed HCA: {implied_hca:.2f} pts")
 
-    # 5. Display Ratings
+    # Display Top 10
     ratings_df = pd.DataFrame({'Team': market_ratings.index, 'Rating': market_ratings.values})
     ratings_df = ratings_df.sort_values('Rating', ascending=False).reset_index(drop=True)
     ratings_df.index += 1
     
-    st.sidebar.header("Market Settings")
-    st.sidebar.metric("Implied HCA", f"{implied_hca:.2f}")
-    st.sidebar.info(f"Using Decay Alpha: {DECAY_ALPHA}")
-
     with st.expander("📊 View Power Ratings"):
-        st.dataframe(ratings_df, height=300, use_container_width=True)
+        st.dataframe(ratings_df.head(25), height=300, use_container_width=True)
 
-    # 6. Projections
-    st.subheader(f"Games for {today_str}")
+    # --- 6. PROJECTIONS ---
+    st.subheader(f"Projections")
     
     if not todays_games:
-        st.info("No games scheduled for today.")
+        st.info(f"No games scheduled for {today_str}.")
     else:
         todays_games.sort(key=lambda x: x['et_datetime'])
         projections = []
@@ -178,15 +228,23 @@ def run_analysis():
             h_r = market_ratings.get(h, 0.0)
             a_r = market_ratings.get(a, 0.0)
             is_neutral = g.get('neutralSite', False)
-            hca_val = 0.0 if is_neutral else implied_hca
+
+            # CALCULATE HCA
+            if is_neutral:
+                hca_val = 0.0
+            else:
+                if use_dynamic_hca:
+                    # Look up specific HCA for this home team
+                    # If not found (new team?), use the average
+                    hca_val = hca_vals.get(h, avg_hca)
+                else:
+                    hca_val = implied_hca
 
             # Raw margin (Positive = Home Wins by X)
             raw_margin = (h_r - a_r) + hca_val
-            
-            # CONVERT TO SPREAD FORMAT (Negative = Home Favorite)
             my_proj_spread = -1 * raw_margin
 
-            # Find Vegas line
+            # Vegas Line
             gid = g.get('id')
             vegas = None
             for l in lines_json:
@@ -195,38 +253,26 @@ def run_analysis():
                     if s is not None: vegas = float(s)
                     break
             
-            # Edge Calculation:
-            # We compare My Spread to Vegas Spread.
-            # Example: My Spread -5.0, Vegas -3.0. I think Home wins by more.
-            # Logic: (Vegas - My_Spread)
-            # If Vegas is -3 and I am -5. I have 2 points of value on Home.
             edge = 0.0
             if vegas is not None:
-                # Calculate edge relative to the Home Team
-                # If my spread is lower (more negative) than Vegas, I like Home.
                 edge = vegas - my_proj_spread
 
-            # Formatting for display
             pick = ""
-            # If Edge is positive, it means Vegas is higher than my spread (e.g. Vegas -3, Me -8 -> Edge 5). 
-            # This means Home covers easily.
             if edge > 3.0: pick = f"BET {h}"
-            # If Edge is negative, it means Vegas is lower than my spread (e.g. Vegas -8, Me -3 -> Edge -5).
-            # This means Away covers.
             elif edge < -3.0: pick = f"BET {a}"
             
             projections.append({
                 'Time': g['et_datetime'].strftime('%I:%M %p'),
                 'Matchup': f"{a} @ {h}",
-                'My Spread': round(my_proj_spread, 1), # Now shows -5.5 for favorites
+                'My Spread': round(my_proj_spread, 1),
                 'Vegas': vegas if vegas is not None else "N/A",
                 'Edge': round(edge, 1),
-                'Pick': pick
+                'Pick': pick,
+                'HCA Used': round(hca_val, 1) # Added column to see the HCA
             })
             
         proj_df = pd.DataFrame(projections)
 
-        # Style the dataframe
         def highlight_picks(val):
             color = ''
             if 'BET' in str(val):
@@ -235,7 +281,7 @@ def run_analysis():
 
         st.dataframe(proj_df.style.applymap(highlight_picks, subset=['Pick']), use_container_width=True)
 
-        # 7. Excel Download
+        # Excel Export
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             ratings_df.to_excel(writer, sheet_name='Ratings')
