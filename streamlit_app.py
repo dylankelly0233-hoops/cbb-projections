@@ -12,10 +12,7 @@ st.set_page_config(page_title="CBB Projections", layout="wide")
 # --- CONFIGURATION ---
 # We use st.secrets for security so your API key isn't public on GitHub
 # If running locally, you can hardcode it, but for web, use secrets (explained below).
-try:
-    API_KEY = st.secrets["API_KEY"]
-except:
-    API_KEY = 'YOUR_API_KEY_HERE'  # Fallback for local testing
+API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
 
 YEAR = 2026
 DECAY_ALPHA = 0.035
@@ -229,4 +226,5 @@ def run_analysis():
 
 
 if __name__ == "__main__":
+
     run_analysis()
