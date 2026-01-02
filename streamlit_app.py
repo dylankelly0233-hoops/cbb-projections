@@ -68,8 +68,7 @@ def run_analysis():
     selected_date = st.sidebar.date_input("Target Date", now_et)
     today_str = selected_date.strftime('%Y-%m-%d')
 
-    # 2. Decay Setting (UPDATED)
-    # Changed step to 0.001 and added format="%.3f" to allow precise 0.035 selection
+    # 2. Decay Setting
     decay_alpha = st.sidebar.slider(
         "Decay Rate (Alpha)", 
         min_value=0.000, 
@@ -181,9 +180,15 @@ def run_analysis():
         hca_vals = coefs[hca_cols]
         hca_vals.index = [c.replace('_HCA', '') for c in hca_vals.index]
         
+        # --- GUARDRAILS APPLIED HERE ---
+        # 1. Floor at 0.0 (No negative HCA)
+        # 2. Ceiling at 6.0 (Max realistic HCA)
+        hca_vals = hca_vals.clip(lower=0.0, upper=6.0)
+        
         market_ratings = raw_ratings - raw_ratings.mean()
         avg_hca = hca_vals.mean()
-        st.sidebar.info(f"Avg Dynamic HCA: {avg_hca:.2f} pts")
+        st.sidebar.info(f"Avg HCA (Clipped): {avg_hca:.2f} pts")
+        st.sidebar.caption("Max HCA capped at 6.0")
         
     else:
         implied_hca = coefs['HFA_Constant']
