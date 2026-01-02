@@ -10,7 +10,6 @@ import io
 st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
-# 1. HARDCODED API KEY (As requested for the quick fix)
 API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
 
 YEAR = 2026
@@ -33,27 +32,24 @@ def utc_to_et(iso_date_str):
     except ValueError:
         return datetime.now()
 
-# --- DATA FETCHING WITH DEBUGGING ---
+# --- DATA FETCHING ---
 @st.cache_data(ttl=3600)
 def fetch_api_data(year):
-    # Debug info visible on the site
     masked_key = API_KEY[:5] + "..." + API_KEY[-5:] if API_KEY else "None"
     st.caption(f"🔐 API Key Status: Loaded (Ends in {API_KEY[-5:]})")
     
     with st.spinner(f'Fetching data for season {year}...'):
-        # 1. Fetch Games
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
             if games_resp.status_code != 200:
                 st.error(f"❌ API Error (Games): Status {games_resp.status_code}")
-                st.code(games_resp.text) # Show exact server response
+                st.code(games_resp.text)
                 return [], []
             games = games_resp.json()
         except Exception as e:
             st.error(f"❌ Connection Error (Games): {e}")
             return [], []
 
-        # 2. Fetch Lines
         try:
             lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year})
             if lines_resp.status_code != 200:
@@ -74,7 +70,6 @@ def run_analysis():
     # 1. Fetch Data
     games_json, lines_json = fetch_api_data(YEAR)
     
-    # DEBUG: Check if data is empty even if successful
     if not games_json:
         st.warning(f"⚠️ API connected, but returned 0 games for Year {YEAR}. Try changing the year.")
         return
@@ -120,7 +115,7 @@ def run_analysis():
         g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
         days_ago = (target_dt_obj - g_date_obj).days
 
-        if days_ago < 0: continue # Skip future
+        if days_ago < 0: continue
 
         weight = np.exp(-DECAY_ALPHA * days_ago)
         matchups.append({
@@ -185,8 +180,12 @@ def run_analysis():
             is_neutral = g.get('neutralSite', False)
             hca_val = 0.0 if is_neutral else implied_hca
 
-            my_line = (h_r - a_r) + hca_val
+            # Raw margin (Positive = Home Wins by X)
+            raw_margin = (h_r - a_r) + hca_val
             
+            # CONVERT TO SPREAD FORMAT (Negative = Home Favorite)
+            my_proj_spread = -1 * raw_margin
+
             # Find Vegas line
             gid = g.get('id')
             vegas = None
@@ -196,17 +195,30 @@ def run_analysis():
                     if s is not None: vegas = float(s)
                     break
             
-            edge = (my_line - (-vegas)) if vegas is not None else 0
-            
+            # Edge Calculation:
+            # We compare My Spread to Vegas Spread.
+            # Example: My Spread -5.0, Vegas -3.0. I think Home wins by more.
+            # Logic: (Vegas - My_Spread)
+            # If Vegas is -3 and I am -5. I have 2 points of value on Home.
+            edge = 0.0
+            if vegas is not None:
+                # Calculate edge relative to the Home Team
+                # If my spread is lower (more negative) than Vegas, I like Home.
+                edge = vegas - my_proj_spread
+
             # Formatting for display
             pick = ""
+            # If Edge is positive, it means Vegas is higher than my spread (e.g. Vegas -3, Me -8 -> Edge 5). 
+            # This means Home covers easily.
             if edge > 3.0: pick = f"BET {h}"
+            # If Edge is negative, it means Vegas is lower than my spread (e.g. Vegas -8, Me -3 -> Edge -5).
+            # This means Away covers.
             elif edge < -3.0: pick = f"BET {a}"
             
             projections.append({
                 'Time': g['et_datetime'].strftime('%I:%M %p'),
                 'Matchup': f"{a} @ {h}",
-                'My Line': round(my_line, 1),
+                'My Spread': round(my_proj_spread, 1), # Now shows -5.5 for favorites
                 'Vegas': vegas if vegas is not None else "N/A",
                 'Edge': round(edge, 1),
                 'Pick': pick
@@ -214,11 +226,11 @@ def run_analysis():
             
         proj_df = pd.DataFrame(projections)
 
-        # Style the dataframe (Highlight Edges)
+        # Style the dataframe
         def highlight_picks(val):
             color = ''
             if 'BET' in str(val):
-                color = 'background-color: #90EE90; color: black; font-weight: bold' # Light Green
+                color = 'background-color: #90EE90; color: black; font-weight: bold'
             return color
 
         st.dataframe(proj_df.style.applymap(highlight_picks, subset=['Pick']), use_container_width=True)
