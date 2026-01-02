@@ -64,17 +64,24 @@ def run_analysis():
     
     # 1. Date Selector
     st.sidebar.subheader("📅 Date Selection")
-    # Default to today
     now_et = datetime.now(timezone(timedelta(hours=-5)))
     selected_date = st.sidebar.date_input("Target Date", now_et)
     today_str = selected_date.strftime('%Y-%m-%d')
 
-    # 2. Decay Setting
-    decay_alpha = st.sidebar.slider("Decay Rate (Alpha)", 0.00, 0.10, 0.035, 0.005)
+    # 2. Decay Setting (UPDATED)
+    # Changed step to 0.001 and added format="%.3f" to allow precise 0.035 selection
+    decay_alpha = st.sidebar.slider(
+        "Decay Rate (Alpha)", 
+        min_value=0.000, 
+        max_value=0.100, 
+        value=0.035, 
+        step=0.001,
+        format="%.3f"
+    )
     
     # 3. HCA Logic Toggle
     st.sidebar.subheader("🏟️ Home Court Logic")
-    use_dynamic_hca = st.sidebar.checkbox("Use Team-Specific HCA", value=False, help="If checked, the model calculates a unique Home Court Advantage for every team. If unchecked, it uses one global average.")
+    use_dynamic_hca = st.sidebar.checkbox("Use Team-Specific HCA", value=False, help="If checked, the model calculates a unique Home Court Advantage for every team.")
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
@@ -98,7 +105,6 @@ def run_analysis():
 
         game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
 
-        # Filter for the SELECTED date, not just "today"
         if date_et == today_str:
             g['et_datetime'] = dt_et
             todays_games.append(g)
@@ -119,12 +125,9 @@ def run_analysis():
         
         if not meta: continue
 
-        # "Time Travel" Logic:
-        # Calculate days ago relative to the USER SELECTED date.
         g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
         days_ago = (target_dt_obj - g_date_obj).days
 
-        # STRICT RULE: Do not use games that haven't happened yet relative to the selected date
         if days_ago < 0: continue 
 
         weight = np.exp(-decay_alpha * days_ago)
@@ -140,34 +143,23 @@ def run_analysis():
         st.error(f"No past games found prior to {today_str} to train the model.")
         return
 
-    # --- 4. REGRESSION (THE SMART PART) ---
-    # Create Team Dummies (1 for Home, -1 for Away)
+    # --- 4. REGRESSION ---
     home_dummies = pd.get_dummies(df['Home'], dtype=int)
     away_dummies = pd.get_dummies(df['Away'], dtype=int)
     all_teams = sorted(list(set(home_dummies.columns) | set(away_dummies.columns)))
 
-    # Align columns
     home_dummies = home_dummies.reindex(columns=all_teams, fill_value=0)
     away_dummies = away_dummies.reindex(columns=all_teams, fill_value=0)
 
-    # Base Matrix: Home - Away
     X_ratings = home_dummies.sub(away_dummies)
 
     if use_dynamic_hca:
-        # COMPLEX METHOD: Add a column for every team representing their specific HCA
-        # We only mark it as '1' if they are the Home Team AND it's not neutral
         X_hca = home_dummies.copy()
-        # Zero out rows where it was a neutral site
         is_neutral_mask = df['Is_Neutral'].values
         X_hca.loc[is_neutral_mask, :] = 0
-        
-        # Rename columns to avoid collision
         X_hca.columns = [f"{c}_HCA" for c in X_hca.columns]
-        
-        # Combine Ratings + HCA columns
         X = pd.concat([X_ratings, X_hca], axis=1)
     else:
-        # SIMPLE METHOD: One single column for HCA
         X = X_ratings.copy()
         X['HFA_Constant'] = df['Is_Neutral'].apply(lambda x: 0 if x else 1)
 
@@ -175,27 +167,21 @@ def run_analysis():
     w_vals = df['Weight'].values
     w_norm = w_vals * (len(w_vals) / w_vals.sum())
 
-    # Ridge Regression
-    clf = Ridge(alpha=1.0, fit_intercept=False) # Increased alpha slightly for stability
+    clf = Ridge(alpha=1.0, fit_intercept=False)
     clf.fit(X, y, sample_weight=w_norm)
 
     # --- 5. EXTRACT RATINGS ---
     coefs = pd.Series(clf.coef_, index=X.columns)
     
     if use_dynamic_hca:
-        # Split coefficients into Ratings and HCA
         rating_cols = [c for c in coefs.index if not c.endswith('_HCA')]
         hca_cols = [c for c in coefs.index if c.endswith('_HCA')]
         
         raw_ratings = coefs[rating_cols]
         hca_vals = coefs[hca_cols]
-        # Clean HCA index names
         hca_vals.index = [c.replace('_HCA', '') for c in hca_vals.index]
         
-        # Center ratings
         market_ratings = raw_ratings - raw_ratings.mean()
-        
-        # Calculate Average HCA for display
         avg_hca = hca_vals.mean()
         st.sidebar.info(f"Avg Dynamic HCA: {avg_hca:.2f} pts")
         
@@ -204,7 +190,7 @@ def run_analysis():
         market_ratings = coefs.drop('HFA_Constant') - coefs.drop('HFA_Constant').mean()
         st.sidebar.info(f"Global Fixed HCA: {implied_hca:.2f} pts")
 
-    # Display Top 10
+    # Display Top 25
     ratings_df = pd.DataFrame({'Team': market_ratings.index, 'Rating': market_ratings.values})
     ratings_df = ratings_df.sort_values('Rating', ascending=False).reset_index(drop=True)
     ratings_df.index += 1
@@ -229,22 +215,17 @@ def run_analysis():
             a_r = market_ratings.get(a, 0.0)
             is_neutral = g.get('neutralSite', False)
 
-            # CALCULATE HCA
             if is_neutral:
                 hca_val = 0.0
             else:
                 if use_dynamic_hca:
-                    # Look up specific HCA for this home team
-                    # If not found (new team?), use the average
                     hca_val = hca_vals.get(h, avg_hca)
                 else:
                     hca_val = implied_hca
 
-            # Raw margin (Positive = Home Wins by X)
             raw_margin = (h_r - a_r) + hca_val
             my_proj_spread = -1 * raw_margin
 
-            # Vegas Line
             gid = g.get('id')
             vegas = None
             for l in lines_json:
@@ -268,7 +249,7 @@ def run_analysis():
                 'Vegas': vegas if vegas is not None else "N/A",
                 'Edge': round(edge, 1),
                 'Pick': pick,
-                'HCA Used': round(hca_val, 1) # Added column to see the HCA
+                'HCA Used': round(hca_val, 1)
             })
             
         proj_df = pd.DataFrame(projections)
