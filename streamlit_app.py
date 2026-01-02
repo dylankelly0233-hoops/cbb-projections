@@ -78,9 +78,10 @@ def run_analysis():
         format="%.3f"
     )
     
-    # 3. HCA Logic Toggle
-    st.sidebar.subheader("🏟️ Home Court Logic")
-    use_dynamic_hca = st.sidebar.checkbox("Use Team-Specific HCA", value=False, help="If checked, the model calculates a unique Home Court Advantage for every team.")
+    # 3. MANUAL HCA CONTROL (Replaces the "Dynamic/Regression" logic)
+    st.sidebar.subheader("🏟️ Home Court Advantage")
+    st.sidebar.caption("Instead of asking the model to guess HCA (which hurts team ratings), set the standard HCA points here.")
+    manual_hca = st.sidebar.slider("Points for HCA", 2.0, 5.0, 3.2, 0.1)
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
@@ -131,9 +132,20 @@ def run_analysis():
 
         weight = np.exp(-decay_alpha * days_ago)
         
+        # --- THE FIX: PRE-BAKE THE HCA ---
+        # We adjust the margin BEFORE the model sees it.
+        # If Home wins by 10, and HCA is 3.2, we tell the model: "They won by 6.8 on a neutral court."
+        # This forces the Team Rating to account for that 6.8 points of skill.
+        adjusted_margin = -1 * float(s) # Start with actual margin
+        
+        if not meta['is_neutral']:
+            # Subtract the manual HCA from the home team's margin
+            adjusted_margin -= manual_hca
+        
         matchups.append({
-            'Home': home, 'Away': away, 'Margin': -1 * float(s),
-            'Is_Neutral': meta['is_neutral'], 'Weight': weight
+            'Home': home, 'Away': away, 
+            'Adjusted_Margin': adjusted_margin, # Uses adjusted margin
+            'Weight': weight
         })
 
     df = pd.DataFrame(matchups)
@@ -150,57 +162,28 @@ def run_analysis():
     home_dummies = home_dummies.reindex(columns=all_teams, fill_value=0)
     away_dummies = away_dummies.reindex(columns=all_teams, fill_value=0)
 
-    X_ratings = home_dummies.sub(away_dummies)
-
-    if use_dynamic_hca:
-        X_hca = home_dummies.copy()
-        is_neutral_mask = df['Is_Neutral'].values
-        X_hca.loc[is_neutral_mask, :] = 0
-        X_hca.columns = [f"{c}_HCA" for c in X_hca.columns]
-        X = pd.concat([X_ratings, X_hca], axis=1)
-    else:
-        X = X_ratings.copy()
-        X['HFA_Constant'] = df['Is_Neutral'].apply(lambda x: 0 if x else 1)
-
-    y = df['Margin']
+    # Simple Matrix: Home - Away
+    X = home_dummies.sub(away_dummies)
+    
+    # We NO LONGER solve for HCA here. We solved it manually above.
+    y = df['Adjusted_Margin']
+    
     w_vals = df['Weight'].values
     w_norm = w_vals * (len(w_vals) / w_vals.sum())
 
-    clf = Ridge(alpha=1.0, fit_intercept=False)
+    clf = Ridge(alpha=1.0, fit_intercept=False) # Fit intercept false because we centered data via HCA subtraction
     clf.fit(X, y, sample_weight=w_norm)
 
     # --- 5. EXTRACT RATINGS ---
     coefs = pd.Series(clf.coef_, index=X.columns)
-    
-    if use_dynamic_hca:
-        rating_cols = [c for c in coefs.index if not c.endswith('_HCA')]
-        hca_cols = [c for c in coefs.index if c.endswith('_HCA')]
-        
-        raw_ratings = coefs[rating_cols]
-        hca_vals = coefs[hca_cols]
-        hca_vals.index = [c.replace('_HCA', '') for c in hca_vals.index]
-        
-        # --- GUARDRAILS APPLIED HERE ---
-        # 1. Floor at 0.0 (No negative HCA)
-        # 2. Ceiling at 6.0 (Max realistic HCA)
-        hca_vals = hca_vals.clip(lower=0.0, upper=6.0)
-        
-        market_ratings = raw_ratings - raw_ratings.mean()
-        avg_hca = hca_vals.mean()
-        st.sidebar.info(f"Avg HCA (Clipped): {avg_hca:.2f} pts")
-        st.sidebar.caption("Max HCA capped at 6.0")
-        
-    else:
-        implied_hca = coefs['HFA_Constant']
-        market_ratings = coefs.drop('HFA_Constant') - coefs.drop('HFA_Constant').mean()
-        st.sidebar.info(f"Global Fixed HCA: {implied_hca:.2f} pts")
+    market_ratings = coefs - coefs.mean() # Center around 0
 
     # Display Top 25
     ratings_df = pd.DataFrame({'Team': market_ratings.index, 'Rating': market_ratings.values})
     ratings_df = ratings_df.sort_values('Rating', ascending=False).reset_index(drop=True)
     ratings_df.index += 1
     
-    with st.expander("📊 View Power Ratings"):
+    with st.expander("📊 View Power Ratings (Pure Skill)"):
         st.dataframe(ratings_df.head(25), height=300, use_container_width=True)
 
     # --- 6. PROJECTIONS ---
@@ -220,14 +203,10 @@ def run_analysis():
             a_r = market_ratings.get(a, 0.0)
             is_neutral = g.get('neutralSite', False)
 
-            if is_neutral:
-                hca_val = 0.0
-            else:
-                if use_dynamic_hca:
-                    hca_val = hca_vals.get(h, avg_hca)
-                else:
-                    hca_val = implied_hca
+            # Apply Manual HCA for projection
+            hca_val = 0.0 if is_neutral else manual_hca
 
+            # Raw margin (Positive = Home Wins by X)
             raw_margin = (h_r - a_r) + hca_val
             my_proj_spread = -1 * raw_margin
 
@@ -250,6 +229,8 @@ def run_analysis():
             projections.append({
                 'Time': g['et_datetime'].strftime('%I:%M %p'),
                 'Matchup': f"{a} @ {h}",
+                'Home Rtg': round(h_r, 1),
+                'Away Rtg': round(a_r, 1),
                 'My Spread': round(my_proj_spread, 1),
                 'Vegas': vegas if vegas is not None else "N/A",
                 'Edge': round(edge, 1),
