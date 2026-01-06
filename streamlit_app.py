@@ -100,11 +100,18 @@ def get_team_name(team_obj):
     return str(team_obj)
 
 def utc_to_et(iso_date_str):
-    # FIXED: Handle missing/TBD times by returning None instead of "Now"
-    # This prevents TBD games from accidentally showing up on "Today"
     if not iso_date_str: return None
     try:
         dt_utc = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
+        
+        # FIXED LOGIC: 
+        # If time is exactly Midnight UTC (00:00:00), it's likely a TBD placeholder.
+        # We return the UTC date AS IS, so it stays on the listed day 
+        # instead of shifting back 5 hours to the previous day.
+        if dt_utc.hour == 0 and dt_utc.minute == 0 and dt_utc.second == 0:
+            return dt_utc
+            
+        # Otherwise, convert to Eastern Time
         dt_et = dt_utc.astimezone(timezone(timedelta(hours=-5)))
         return dt_et
     except ValueError:
@@ -298,13 +305,12 @@ def run_analysis():
     coefs = pd.Series(clf.coef_, index=X.columns)
     market_ratings = coefs - coefs.mean()
 
-    # Display FULL D1 Ratings (Removed .head(25))
+    # Display FULL D1 Ratings
     ratings_df = pd.DataFrame({'Team': market_ratings.index, 'Rating': market_ratings.values})
     ratings_df = ratings_df.sort_values('Rating', ascending=False).reset_index(drop=True)
     ratings_df.index += 1
     
     with st.expander("📊 View Power Ratings (Neutral Court)"):
-        # Just pass the full dataframe. Streamlit handles scrolling automatically.
         st.dataframe(ratings_df, height=300, use_container_width=True)
 
     # --- 6. PROJECTIONS ---
