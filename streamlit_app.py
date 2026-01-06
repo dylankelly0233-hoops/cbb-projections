@@ -10,8 +10,8 @@ import io
 st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
-# ⚠️ IMPORTANT: Paste your NEW, secure API Key below.
-API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo' 
+# ⚠️ PASTE YOUR API KEY BELOW
+API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
 
 YEAR = 2026
 BASE_URL = 'https://api.collegebasketballdata.com'
@@ -102,16 +102,8 @@ def get_team_name(team_obj):
 def utc_to_et(iso_date_str):
     if not iso_date_str: return None
     try:
+        # Standard Conversion: UTC -> ET (-5 hours)
         dt_utc = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
-        
-        # FIXED LOGIC: 
-        # If time is exactly Midnight UTC (00:00:00), it's likely a TBD placeholder.
-        # We return the UTC date AS IS, so it stays on the listed day 
-        # instead of shifting back 5 hours to the previous day.
-        if dt_utc.hour == 0 and dt_utc.minute == 0 and dt_utc.second == 0:
-            return dt_utc
-            
-        # Otherwise, convert to Eastern Time
         dt_et = dt_utc.astimezone(timezone(timedelta(hours=-5)))
         return dt_et
     except ValueError:
@@ -212,8 +204,15 @@ def run_analysis():
         raw_start = g.get('startDate', '')
         dt_et = utc_to_et(raw_start)
         
-        # LOGIC FIX:
-        if dt_et:
+        # LOGIC FIX: Trust the API's 'day' field if it exists.
+        # This prevents the "Timezone Drift" bug where late/early games move to the wrong day.
+        api_day = g.get('day') 
+        
+        if api_day:
+            # api_day is usually "2026-01-06T00:00:00" -> extract date only
+            date_et = api_day.split('T')[0]
+        elif dt_et:
+            # Fallback to calculated date if 'day' is missing
             date_et = dt_et.strftime('%Y-%m-%d')
         else:
             date_et = "Unknown"
@@ -224,7 +223,7 @@ def run_analysis():
             if dt_et:
                 g['et_datetime'] = dt_et
             else:
-                # If for some reason date matched but time is missing (rare), put it at end of day
+                # Placeholder for truly unknown times so they sort to the bottom
                 g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d')
             
             todays_games.append(g)
