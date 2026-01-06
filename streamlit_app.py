@@ -11,13 +11,13 @@ st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
 # ⚠️ PASTE YOUR API KEY BELOW
-API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
+API_KEY = 'PASTE_YOUR_NEW_KEY_HERE'
 
 YEAR = 2026
 BASE_URL = 'https://api.collegebasketballdata.com'
 HEADERS = {'Authorization': f'Bearer {API_KEY}', 'accept': 'application/json'}
 
-# --- KENPOM DATA (Cleaned & Processed) ---
+# --- KENPOM DATA ---
 KENPOM_HCA_DATA = {
     "West Virginia": 4.5, "TCU": 4.5, "Utah": 4.5, "New Mexico": 4.3, "Wake Forest": 4.2,
     "Texas Tech": 4.2, "Oklahoma": 4.1, "Utah St.": 4.1, "BYU": 4.1, "Rutgers": 4.0,
@@ -102,7 +102,6 @@ def get_team_name(team_obj):
 def utc_to_et(iso_date_str):
     if not iso_date_str: return None
     try:
-        # Standard Conversion: UTC -> ET (-5 hours)
         dt_utc = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
         dt_et = dt_utc.astimezone(timezone(timedelta(hours=-5)))
         return dt_et
@@ -112,17 +111,14 @@ def utc_to_et(iso_date_str):
 def get_kenpom_hca(api_name, default_hca):
     if api_name in KENPOM_HCA_DATA:
         return KENPOM_HCA_DATA[api_name]
-    
     if "State" in api_name:
         try_name = api_name.replace("State", "St.")
         if try_name in KENPOM_HCA_DATA:
             return KENPOM_HCA_DATA[try_name]
-            
     if "St." in api_name:
         try_name = api_name.replace("St.", "State")
         if try_name in KENPOM_HCA_DATA:
             return KENPOM_HCA_DATA[try_name]
-    
     return default_hca
 
 # --- DATA FETCHING ---
@@ -194,7 +190,6 @@ def run_analysis():
     todays_games = []
     game_meta = {}
     
-    # DEBUG COUNTERS
     debug_games_found = 0
 
     for g in games_json:
@@ -202,26 +197,39 @@ def run_analysis():
         a = get_team_name(g.get('awayTeam'))
         
         raw_start = g.get('startDate', '')
-        dt_et = utc_to_et(raw_start)
         
-        # LOGIC FIX: Trust the API's 'day' field if it exists.
-        # This prevents the "Timezone Drift" bug where late/early games move to the wrong day.
-        api_day = g.get('day') 
+        # --- ROBUST DATE LOGIC ---
+        # 1. Trust the 'day' field first (YYYY-MM-DD) if available
+        # This solves the timezone shift because the API explicitly states the date.
+        api_day = g.get('day')
         
+        dt_et = None
+        if raw_start:
+            dt_et = utc_to_et(raw_start)
+
         if api_day:
-            # api_day is usually "2026-01-06T00:00:00" -> extract date only
+            # Usually strict YYYY-MM-DD, but sometimes has time attached. Split to be safe.
             date_et = api_day.split('T')[0]
         elif dt_et:
-            # Fallback to calculated date if 'day' is missing
-            date_et = dt_et.strftime('%Y-%m-%d')
+            # Fallback: If 'day' is missing, check for the "Midnight UTC" signature
+            # 00:00 UTC = 19:00 EST (Previous Day). We want to reverse that if it's TBD.
+            if raw_start.endswith("00:00:00.000Z") or raw_start.endswith("T00:00:00Z"):
+                 # It is likely TBD. Use the raw date string from the API (ignoring timezone shift)
+                 date_et = raw_start.split('T')[0]
+            else:
+                 # Standard conversion for confirmed times
+                 date_et = dt_et.strftime('%Y-%m-%d')
         else:
             date_et = "Unknown"
 
         game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
 
+        # MATCHING LOGIC
         if date_et == today_str:
             if dt_et:
                 g['et_datetime'] = dt_et
+                # Display time nicely. If it's 7 PM EST and we suspected TBD, mark it?
+                # For now, just show the time.
             else:
                 # Placeholder for truly unknown times so they sort to the bottom
                 g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d')
