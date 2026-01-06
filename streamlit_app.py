@@ -5,19 +5,19 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from sklearn.linear_model import Ridge
 import io
-import re
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
-API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
+# ⚠️ IMPORTANT: Paste your NEW, secure API Key below.
+API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo' 
+
 YEAR = 2026
 BASE_URL = 'https://api.collegebasketballdata.com'
 HEADERS = {'Authorization': f'Bearer {API_KEY}', 'accept': 'application/json'}
 
 # --- KENPOM DATA (Cleaned & Processed) ---
-# This maps the KenPom Name to the HCA value from your table
 KENPOM_HCA_DATA = {
     "West Virginia": 4.5, "TCU": 4.5, "Utah": 4.5, "New Mexico": 4.3, "Wake Forest": 4.2,
     "Texas Tech": 4.2, "Oklahoma": 4.1, "Utah St.": 4.1, "BYU": 4.1, "Rutgers": 4.0,
@@ -100,36 +100,31 @@ def get_team_name(team_obj):
     return str(team_obj)
 
 def utc_to_et(iso_date_str):
-    if not iso_date_str: return datetime.now()
+    # FIXED: Handle missing/TBD times by returning None instead of "Now"
+    # This prevents TBD games from accidentally showing up on "Today"
+    if not iso_date_str: return None
     try:
         dt_utc = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
         dt_et = dt_utc.astimezone(timezone(timedelta(hours=-5)))
         return dt_et
     except ValueError:
-        return datetime.now()
+        return None
 
-# 🛠️ SMART LOOKUP FOR KENPOM NAMES
 def get_kenpom_hca(api_name, default_hca):
-    # 1. Try Exact Match
     if api_name in KENPOM_HCA_DATA:
         return KENPOM_HCA_DATA[api_name]
     
-    # 2. Try Standardizing "State" to "St." (KenPom likes St.)
     if "State" in api_name:
         try_name = api_name.replace("State", "St.")
         if try_name in KENPOM_HCA_DATA:
             return KENPOM_HCA_DATA[try_name]
             
-    # 3. Try Removing "St." to "State" (Just in case)
     if "St." in api_name:
         try_name = api_name.replace("St.", "State")
         if try_name in KENPOM_HCA_DATA:
             return KENPOM_HCA_DATA[try_name]
-
-    # 4. Try removing "University" or common suffixes
-    # (Add more rules here if you notice specific teams missing)
     
-    return default_hca # Fallback if not found
+    return default_hca
 
 # --- DATA FETCHING ---
 @st.cache_data(ttl=3600)
@@ -140,7 +135,7 @@ def fetch_api_data(year):
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
             if games_resp.status_code != 200:
-                st.error(f"❌ API Error (Games): {games_resp.status_code}")
+                st.error(f"❌ API Error (Games): {games_resp.status_code}. Check your API Key.")
                 return [], []
             games = games_resp.json()
         except Exception as e:
@@ -193,25 +188,48 @@ def run_analysis():
     games_json, lines_json = fetch_api_data(YEAR)
     
     if not games_json:
-        st.warning("No data loaded.")
+        st.warning("No data loaded. Check API Key or Connection.")
         return
 
     # --- 2. PROCESS GAMES ---
     todays_games = []
     game_meta = {}
+    
+    # DEBUG COUNTERS
+    debug_games_found = 0
 
     for g in games_json:
         h = get_team_name(g.get('homeTeam'))
         a = get_team_name(g.get('awayTeam'))
+        
         raw_start = g.get('startDate', '')
         dt_et = utc_to_et(raw_start)
-        date_et = dt_et.strftime('%Y-%m-%d')
+        
+        # LOGIC FIX:
+        if dt_et:
+            date_et = dt_et.strftime('%Y-%m-%d')
+        else:
+            date_et = "Unknown"
 
         game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
 
         if date_et == today_str:
-            g['et_datetime'] = dt_et
+            if dt_et:
+                g['et_datetime'] = dt_et
+            else:
+                # If for some reason date matched but time is missing (rare), put it at end of day
+                g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d')
+            
             todays_games.append(g)
+            debug_games_found += 1
+
+    # --- DEBUG SECTION ---
+    with st.sidebar.expander("🕵️ Debug Data"):
+        st.write(f"Games found for {today_str}: {debug_games_found}")
+        st.write(f"Total Games in Database: {len(games_json)}")
+        if debug_games_found == 0 and len(games_json) > 0:
+            st.caption("First 3 raw games from API (to check dates):")
+            st.write(games_json[:3])
 
     # --- 3. BUILD TRAINING MATRIX ---
     matchups = []
@@ -227,7 +245,8 @@ def run_analysis():
         away = get_team_name(game.get('awayTeam'))
         meta = game_meta.get(f"{home}_{away}")
         
-        if not meta: continue
+        # Skip if we couldn't find game metadata (date, neutral status)
+        if not meta or meta['date_et'] == "Unknown": continue
 
         g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
         days_ago = (target_dt_obj - g_date_obj).days
@@ -240,7 +259,6 @@ def run_analysis():
         adjusted_margin = -1 * float(s)
         
         if not meta['is_neutral']:
-            # DETERMINE HCA TO SUBTRACT
             if hca_mode == "Manual Slider":
                 hca_to_remove = manual_hca
             else:
@@ -280,13 +298,14 @@ def run_analysis():
     coefs = pd.Series(clf.coef_, index=X.columns)
     market_ratings = coefs - coefs.mean()
 
-    # Display Top 25
+    # Display FULL D1 Ratings (Removed .head(25))
     ratings_df = pd.DataFrame({'Team': market_ratings.index, 'Rating': market_ratings.values})
     ratings_df = ratings_df.sort_values('Rating', ascending=False).reset_index(drop=True)
     ratings_df.index += 1
     
     with st.expander("📊 View Power Ratings (Neutral Court)"):
-        st.dataframe(ratings_df.head(25), height=300, use_container_width=True)
+        # Just pass the full dataframe. Streamlit handles scrolling automatically.
+        st.dataframe(ratings_df, height=300, use_container_width=True)
 
     # --- 6. PROJECTIONS ---
     st.subheader(f"Projections")
@@ -333,8 +352,11 @@ def run_analysis():
             if edge > 3.0: pick = f"BET {h}"
             elif edge < -3.0: pick = f"BET {a}"
             
+            # Format time nicely (or TBD)
+            time_str = g['et_datetime'].strftime('%I:%M %p')
+            
             projections.append({
-                'Time': g['et_datetime'].strftime('%I:%M %p'),
+                'Time': time_str,
                 'Matchup': f"{a} @ {h}",
                 'Home Rtg': round(h_r, 1),
                 'Away Rtg': round(a_r, 1),
