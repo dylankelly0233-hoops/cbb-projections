@@ -199,37 +199,41 @@ def run_analysis():
         h = get_team_name(g.get('homeTeam'))
         a = get_team_name(g.get('awayTeam'))
         
-        # --- ROBUST FILTERING ---
+        # --- ROBUST CATCH-ALL FILTERING ---
+        # We calculate TWO possible dates for every game.
+        # 1. API Date (Officially assigned betting day)
+        # 2. ET Date (Calculated from timestamp)
+        
         api_day = g.get('day', '') 
         raw_start = g.get('startDate', '')
 
-        # 1. DETERMINE DATE FOR FILTERING
-        # Use 'day' if available (Best for Tomorrow's games)
-        # Fallback to 'startDate' if missing (Best for Past/Training games)
-        date_et = "Unknown"
-        
+        api_date_str = "Unknown"
         if api_day:
-            date_et = api_day.split('T')[0]
-        elif raw_start:
-            dt_et = utc_to_et(raw_start)
-            if dt_et:
-                date_et = dt_et.strftime('%Y-%m-%d')
+            api_date_str = api_day.split('T')[0]
+            
+        calc_date_str = "Unknown"
+        dt_et = utc_to_et(raw_start)
+        if dt_et:
+            calc_date_str = dt_et.strftime('%Y-%m-%d')
+            
+        # Store the 'Best Available' date for training history (prioritize API, fallback to Calc)
+        final_date_for_history = api_date_str if api_date_str != "Unknown" else calc_date_str
+        
+        game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': final_date_for_history}
 
-        game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
-
-        # 2. CHECK IF GAME IS "TODAY" (User Selected Date)
+        # CHECK IF MATCH (BROAD MATCH)
+        # If either the API says it's today OR the Time says it's today, include it.
         is_today = False
-        if api_day and api_day.startswith(today_str):
+        if api_date_str == today_str:
             is_today = True
-        elif not api_day and date_et == today_str:
+        elif calc_date_str == today_str:
             is_today = True
             
         # ADD TO LIST IF MATCH
         if is_today:
             # Handle Display Time
-            dt_display = utc_to_et(raw_start)
-            if dt_display:
-                g['et_datetime'] = dt_display
+            if dt_et:
+                g['et_datetime'] = dt_et
             else:
                 g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d') + timedelta(hours=23, minutes=59)
             
@@ -261,34 +265,38 @@ def run_analysis():
         # Skip if we couldn't find game metadata (date, neutral status)
         if not meta or meta['date_et'] == "Unknown": continue
 
-        g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
-        days_ago = (target_dt_obj - g_date_obj).days
+        try:
+            g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
+            days_ago = (target_dt_obj - g_date_obj).days
 
-        if days_ago < 0: continue 
-
-        weight = np.exp(-decay_alpha * days_ago)
-        
-        # --- PRE-BAKE HCA LOGIC ---
-        adjusted_margin = -1 * float(s)
-        
-        if not meta['is_neutral']:
-            if hca_mode == "Manual Slider":
-                hca_to_remove = manual_hca
-            else:
-                hca_to_remove = get_kenpom_hca(home, 3.2)
+            if days_ago < 0: continue 
             
-            adjusted_margin -= hca_to_remove
-        
-        matchups.append({
-            'Home': home, 'Away': away, 
-            'Adjusted_Margin': adjusted_margin, 
-            'Weight': weight
-        })
+            # Decay Calculation
+            weight = np.exp(-decay_alpha * days_ago)
+            
+            # --- PRE-BAKE HCA LOGIC ---
+            adjusted_margin = -1 * float(s)
+            
+            if not meta['is_neutral']:
+                if hca_mode == "Manual Slider":
+                    hca_to_remove = manual_hca
+                else:
+                    hca_to_remove = get_kenpom_hca(home, 3.2)
+                
+                adjusted_margin -= hca_to_remove
+            
+            matchups.append({
+                'Home': home, 'Away': away, 
+                'Adjusted_Margin': adjusted_margin, 
+                'Weight': weight
+            })
+        except:
+            continue
 
     df = pd.DataFrame(matchups)
     
     if df.empty:
-        st.error(f"No past games found prior to {today_str} to train the model.")
+        st.error(f"No past games found prior to {today_str} to train the model. (Try picking a later date or checking API data)")
         return
 
     # --- 4. REGRESSION ---
