@@ -121,41 +121,25 @@ def get_kenpom_hca(api_name, default_hca):
             return KENPOM_HCA_DATA[try_name]
     return default_hca
 
-# --- DATA FETCHING ---
-
-# 1. FETCH FULL HISTORY (Cached, for Training Model)
+# --- DATA FETCHING (FULL SEASON) ---
 @st.cache_data(ttl=3600)
-def fetch_season_history(year):
+def fetch_data(year):
     masked_key = API_KEY[:5] + "..." + API_KEY[-5:] if API_KEY else "None"
-    with st.spinner(f'Fetching season history ({year}) for model...'):
+    with st.spinner(f'Fetching FULL season {year} data...'):
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
             lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year})
             
-            if games_resp.status_code != 200: return [], []
+            if games_resp.status_code != 200:
+                st.error(f"❌ API Error: {games_resp.status_code}")
+                return [], []
             return games_resp.json(), lines_resp.json()
-        except Exception:
-            return [], []
-
-# 2. FETCH SPECIFIC DAILY SLATE (Live, for Display)
-# This forces the API to give us the exact games for the selected date.
-def fetch_daily_slate(date_str):
-    with st.spinner(f'Fetching live slate for {date_str}...'):
-        try:
-            # Fetch games for specific date
-            games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'date': date_str})
-            # Fetch lines for specific date
-            lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'date': date_str})
-            
-            g_json = games_resp.json() if games_resp.status_code == 200 else []
-            l_json = lines_resp.json() if lines_resp.status_code == 200 else []
-            return g_json, l_json
-        except Exception:
+        except Exception as e:
+            st.error(f"❌ Connection Error: {e}")
             return [], []
 
 # --- MAIN LOGIC ---
 def run_analysis():
-    # --- SIDEBAR CONTROLS ---
     st.sidebar.title("⚙️ Settings")
     
     # 1. Date Selector
@@ -168,91 +152,99 @@ def run_analysis():
     decay_alpha = st.sidebar.slider("Decay Alpha", 0.000, 0.100, 0.035, 0.001, format="%.3f")
     
     # 3. HCA SOURCE TOGGLE
-    st.sidebar.subheader("🏟️ Home Court Source")
-    hca_mode = st.sidebar.radio(
-        "Choose HCA Data:",
-        ["Manual Slider", "KenPom (Static Table)"],
-        index=0
-    )
-
+    hca_mode = st.sidebar.radio("HCA Source:", ["Manual Slider", "KenPom"], index=0)
     if hca_mode == "Manual Slider":
-        manual_hca = st.sidebar.slider("Global HCA Points", 2.0, 5.0, 3.2, 0.1)
+        manual_hca = st.sidebar.slider("Global HCA", 2.0, 5.0, 3.2, 0.1)
     else:
-        st.sidebar.info("Using KenPom Table data. If a team name doesn't match, it defaults to 3.2.")
+        st.sidebar.info("Using KenPom data.")
         manual_hca = 3.2 
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
     # --- 1. LOAD DATA ---
-    
-    # A. Get Training Data (History)
-    hist_games, hist_lines = fetch_season_history(YEAR)
-    if not hist_games:
-        st.warning("Could not load season history. Model might be inaccurate.")
-    
-    # B. Get Target Data (Today's Games)
-    # 🚀 KEY FIX: We ask the API strictly for today's games. No filtering logic needed.
-    target_games, target_lines = fetch_daily_slate(today_str)
+    games_json, lines_json = fetch_data(YEAR)
+    if not games_json: return
 
-    # --- 2. TRAIN MODEL (Using History) ---
-    matchups = []
+    # --- 2. PREP DATA & FILTER FOR TODAY ---
+    matchups_train = []
+    target_games = []
     target_dt_obj = datetime.strptime(today_str, '%Y-%m-%d')
     
-    # Map history games to dates
-    hist_game_map = {}
-    for g in hist_games:
+    debug_total_games = len(games_json)
+    debug_today_count = 0
+
+    # Build Map for Training
+    # Also filter "Target Games" locally here
+    game_map = {}
+    
+    for g in games_json:
         h = get_team_name(g.get('homeTeam'))
         a = get_team_name(g.get('awayTeam'))
         
-        # Robust Date Parse for History
-        raw_start = g.get('startDate', '')
-        api_day = g.get('day', '')
+        # --- ROBUST DATE LOGIC ---
+        # We calculate BOTH possible dates (API official day AND ET Calculated day)
+        # If EITHER matches 'today_str', we show it.
         
-        d_str = "Unknown"
-        if api_day: d_str = api_day.split('T')[0]
-        elif raw_start: 
-            dt = utc_to_et(raw_start)
-            if dt: d_str = dt.strftime('%Y-%m-%d')
-            
-        hist_game_map[f"{h}_{a}"] = {'date': d_str, 'neutral': g.get('neutralSite', False)}
+        api_day = g.get('day', '')
+        raw_start = g.get('startDate', '')
+        
+        date_api = api_day.split('T')[0] if api_day else "Unknown"
+        
+        dt_et = utc_to_et(raw_start)
+        date_calc = dt_et.strftime('%Y-%m-%d') if dt_et else "Unknown"
+        
+        # Determine strict date for Training History (prefer API day)
+        hist_date = date_api if date_api != "Unknown" else date_calc
+        
+        # Store metadata
+        game_map[f"{h}_{a}"] = {'date': hist_date, 'neutral': g.get('neutralSite', False)}
 
-    # Build Training Set
-    for line in hist_lines:
+        # FILTER FOR DISPLAY ("Is this game today?")
+        is_today = False
+        if date_api == today_str: is_today = True
+        elif date_calc == today_str: is_today = True
+        
+        if is_today:
+            if dt_et: g['et_time'] = dt_et.strftime('%I:%M %p')
+            else: g['et_time'] = "TBD"
+            target_games.append(g)
+            debug_today_count += 1
+
+    # --- 3. TRAIN MODEL (Using History) ---
+    for line in lines_json:
         s = line.get('lines', [])[0].get('spread') if line.get('lines') else None
         if s is None: continue
 
         h = get_team_name(line.get('homeTeam'))
         a = get_team_name(line.get('awayTeam'))
-        meta = hist_game_map.get(f"{h}_{a}")
+        meta = game_map.get(f"{h}_{a}")
         
         if not meta or meta['date'] == "Unknown": continue
         
-        # Only train on PAST games
         try:
             g_date = datetime.strptime(meta['date'], '%Y-%m-%d')
             days_ago = (target_dt_obj - g_date).days
-            if days_ago <= 0: continue # Skip today or future
+            if days_ago <= 0: continue # Skip today/future for training
             
             weight = np.exp(-decay_alpha * days_ago)
             
-            # HCA Logic
             adj_margin = -1 * float(s)
             if not meta['neutral']:
                 hca = manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(h, 3.2)
                 adj_margin -= hca
                 
-            matchups.append({
+            matchups_train.append({
                 'Home': h, 'Away': a, 'Adjusted_Margin': adj_margin, 'Weight': weight
             })
         except: continue
 
-    df_train = pd.DataFrame(matchups)
+    df_train = pd.DataFrame(matchups_train)
     
     if df_train.empty:
-        st.error("No historical games found to train model.")
+        st.error("No historical games found.")
         return
 
-    # Ridge Regression
+    # Regression
     h_dum = pd.get_dummies(df_train['Home'], dtype=int)
     a_dum = pd.get_dummies(df_train['Away'], dtype=int)
     all_t = sorted(list(set(h_dum.columns) | set(a_dum.columns)))
@@ -269,108 +261,86 @@ def run_analysis():
     
     market_ratings = pd.Series(clf.coef_, index=X.columns)
     market_ratings = market_ratings - market_ratings.mean()
-
-    # --- 3. SHOW RATINGS ---
+    
+    # --- 4. SHOW RATINGS ---
     ratings_df = pd.DataFrame({'Team': market_ratings.index, 'Rating': market_ratings.values})
     ratings_df = ratings_df.sort_values('Rating', ascending=False).reset_index(drop=True)
     ratings_df.index += 1
-    
-    with st.expander("📊 View Power Ratings (Neutral Court)"):
+    with st.expander("📊 View Power Ratings"):
         st.dataframe(ratings_df, height=300, use_container_width=True)
 
-    # --- 4. PREDICT TODAY'S GAMES (Using Target Data) ---
-    st.subheader(f"Projections")
+    # --- 5. SHOW PROJECTIONS ---
+    st.subheader(f"Projections ({len(target_games)} games)")
     
     if not target_games:
-        st.info(f"No games found from API for {today_str}.")
-    else:
-        # Pre-process target lines for lookup
-        today_lines_map = {}
-        for l in target_lines:
-            gid = str(l.get('gameId'))
-            if l.get('lines'):
-                today_lines_map[gid] = l['lines'][0].get('spread')
+        st.info("No games found for this date.")
+        return
 
-        projections = []
+    # Map Lines for Today
+    today_lines_map = {}
+    for l in lines_json:
+        gid = str(l.get('gameId'))
+        if l.get('lines'): today_lines_map[gid] = l['lines'][0].get('spread')
+
+    projections = []
+    for g in target_games:
+        h = get_team_name(g.get('homeTeam'))
+        a = get_team_name(g.get('awayTeam'))
         
-        for g in target_games:
-            h = get_team_name(g.get('homeTeam'))
-            a = get_team_name(g.get('awayTeam'))
-            
-            # Ratings
-            h_r = market_ratings.get(h, 0.0)
-            a_r = market_ratings.get(a, 0.0)
-            
-            # HCA
-            is_neutral = g.get('neutralSite', False)
-            if is_neutral:
-                hca_val = 0.0
-            else:
-                hca_val = manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(h, 3.2)
-            
-            # Prediction
-            raw_margin = (h_r - a_r) + hca_val
-            proj_spread = -1 * raw_margin
-            
-            # Vegas Line
-            gid = str(g.get('id'))
-            vegas = today_lines_map.get(gid)
-            if vegas is not None: vegas = float(vegas)
-            
-            # Edge
-            edge = 0.0
-            if vegas is not None:
-                edge = vegas - proj_spread
-                
-            pick = ""
-            if edge > 3.0: pick = f"BET {h}"
-            elif edge < -3.0: pick = f"BET {a}"
-            
-            # Time Display
-            raw_start = g.get('startDate', '')
-            dt = utc_to_et(raw_start)
-            t_str = dt.strftime('%I:%M %p') if dt else "TBD"
-            
-            projections.append({
-                'Time': t_str,
-                'Matchup': f"{a} @ {h}",
-                'Home Rtg': round(h_r, 1),
-                'Away Rtg': round(a_r, 1),
-                'My Spread': round(proj_spread, 1),
-                'Vegas': vegas if vegas is not None else "N/A",
-                'Edge': round(edge, 1),
-                'Pick': pick
-            })
-            
-        # Display Table
-        proj_df = pd.DataFrame(projections)
+        h_r = market_ratings.get(h, 0.0)
+        a_r = market_ratings.get(a, 0.0)
         
-        # Sort by Time if possible
-        try:
-            proj_df['dt_sort'] = pd.to_datetime(proj_df['Time'], format='%I:%M %p', errors='coerce')
-            proj_df = proj_df.sort_values('dt_sort').drop('dt_sort', axis=1)
-        except: pass
-
-        def highlight_picks(val):
-            color = ''
-            if 'BET' in str(val):
-                color = 'background-color: #90EE90; color: black; font-weight: bold'
-            return color
-
-        st.dataframe(proj_df.style.applymap(highlight_picks, subset=['Pick']), use_container_width=True)
-
-        # Excel Export
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            ratings_df.to_excel(writer, sheet_name='Ratings')
-            proj_df.to_excel(writer, sheet_name='Projections', index=False)
+        is_neutral = g.get('neutralSite', False)
+        if is_neutral: hca_val = 0.0
+        else: hca_val = manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(h, 3.2)
         
-        st.download_button(
-            label="📥 Download Excel Report",
-            data=buffer.getvalue(),
-            file_name=f"CBB_Projections_{today_str}.xlsx",
-            mime="application/vnd.ms-excel"
-        )
+        proj_spread = -1 * ((h_r - a_r) + hca_val)
+        
+        gid = str(g.get('id'))
+        vegas = today_lines_map.get(gid)
+        if vegas is not None: vegas = float(vegas)
+        
+        edge = 0.0
+        if vegas is not None: edge = vegas - proj_spread
+            
+        pick = ""
+        if edge > 3.0: pick = f"BET {h}"
+        elif edge < -3.0: pick = f"BET {a}"
+        
+        projections.append({
+            'Time': g['et_time'],
+            'Matchup': f"{a} @ {h}",
+            'Home Rtg': round(h_r, 1),
+            'Away Rtg': round(a_r, 1),
+            'My Spread': round(proj_spread, 1),
+            'Vegas': vegas if vegas is not None else "N/A",
+            'Edge': round(edge, 1),
+            'Pick': pick
+        })
+        
+    proj_df = pd.DataFrame(projections)
+    
+    # Sort by time
+    try:
+        proj_df['dt_sort'] = pd.to_datetime(proj_df['Time'], format='%I:%M %p', errors='coerce')
+        proj_df = proj_df.sort_values('dt_sort').drop('dt_sort', axis=1)
+    except: pass
+
+    def highlight_picks(val):
+        color = ''
+        if 'BET' in str(val):
+            color = 'background-color: #90EE90; color: black; font-weight: bold'
+        return color
+
+    st.dataframe(proj_df.style.applymap(highlight_picks, subset=['Pick']), use_container_width=True)
+
+    # Excel Export
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+        ratings_df.to_excel(writer, sheet_name='Ratings')
+        proj_df.to_excel(writer, sheet_name='Projections', index=False)
+    
+    st.download_button("📥 Download Excel", buffer.getvalue(), f"CBB_{today_str}.xlsx", "application/vnd.ms-excel")
 
 if __name__ == "__main__":
     run_analysis()
