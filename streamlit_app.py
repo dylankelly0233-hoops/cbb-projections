@@ -100,7 +100,8 @@ def get_team_name(team_obj):
     return str(team_obj)
 
 def utc_to_et(iso_date_str):
-    if not iso_date_str: return None # <--- FIXED: Return None instead of Now()
+    # FIX: Return None if TBD, don't default to "Now"
+    if not iso_date_str: return None
     try:
         dt_utc = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
         dt_et = dt_utc.astimezone(timezone(timedelta(hours=-5)))
@@ -108,7 +109,6 @@ def utc_to_et(iso_date_str):
     except ValueError:
         return None
 
-# 🛠️ SMART LOOKUP FOR KENPOM NAMES
 def get_kenpom_hca(api_name, default_hca):
     if api_name in KENPOM_HCA_DATA:
         return KENPOM_HCA_DATA[api_name]
@@ -125,23 +125,33 @@ def get_kenpom_hca(api_name, default_hca):
 # --- DATA FETCHING ---
 @st.cache_data(ttl=3600)
 def fetch_api_data(year):
-    masked_key = API_KEY[:5] + "..." + API_KEY[-5:] if API_KEY else "None"
     with st.spinner(f'Fetching data for season {year}...'):
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
-            lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year})
             if games_resp.status_code != 200:
-                st.error(f"❌ API Error: {games_resp.status_code}")
+                st.error(f"❌ API Error (Games): {games_resp.status_code}")
                 return [], []
-            return games_resp.json(), lines_resp.json()
+            games = games_resp.json()
         except Exception as e:
-            st.error(f"❌ Connection Error: {e}")
+            st.error(f"❌ Connection Error (Games): {e}")
             return [], []
+
+        try:
+            lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year})
+            if lines_resp.status_code != 200:
+                st.error(f"❌ API Error (Lines): {lines_resp.status_code}")
+                return [], []
+            lines = lines_resp.json()
+        except Exception as e:
+            st.error(f"❌ Connection Error (Lines): {e}")
+            return [], []
+        
+        return games, lines
 
 # --- MAIN LOGIC ---
 def run_analysis():
-    # --- SIDEBAR CONTROLS ---
     st.sidebar.title("⚙️ Settings")
+    
     st.sidebar.subheader("📅 Date Selection")
     now_et = datetime.now(timezone(timedelta(hours=-5)))
     selected_date = st.sidebar.date_input("Target Date", now_et)
@@ -150,15 +160,21 @@ def run_analysis():
     decay_alpha = st.sidebar.slider("Decay Alpha", 0.000, 0.100, 0.035, 0.001, format="%.3f")
     
     hca_mode = st.sidebar.radio("Choose HCA Data:", ["Manual Slider", "KenPom (Static Table)"], index=0)
-    manual_hca = st.sidebar.slider("Global HCA Points", 2.0, 5.0, 3.2, 0.1) if hca_mode == "Manual Slider" else 3.2
+    if hca_mode == "Manual Slider":
+        manual_hca = st.sidebar.slider("Global HCA Points", 2.0, 5.0, 3.2, 0.1)
+    else:
+        st.sidebar.info("Using KenPom Table data. If a team name doesn't match, it defaults to 3.2.")
+        manual_hca = 3.2 
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
-    # --- 1. FETCH DATA ---
+    # 1. FETCH DATA
     games_json, lines_json = fetch_api_data(YEAR)
-    if not games_json: return
+    if not games_json:
+        st.warning("No data loaded.")
+        return
 
-    # --- 2. PROCESS GAMES (FIXED FILTERING) ---
+    # 2. PROCESS GAMES
     todays_games = []
     game_meta = {}
 
@@ -166,36 +182,38 @@ def run_analysis():
         h = get_team_name(g.get('homeTeam'))
         a = get_team_name(g.get('awayTeam'))
         
-        # --- ROBUST CATCH-ALL LOGIC ---
-        # 1. Check API "Day" (Official Betting Date)
-        api_day = g.get('day', '')
-        api_date = api_day.split('T')[0] if api_day else "Unknown"
-        
-        # 2. Check Timezone Date (Calculated from StartTime)
         raw_start = g.get('startDate', '')
         dt_et = utc_to_et(raw_start)
-        calc_date = dt_et.strftime('%Y-%m-%d') if dt_et else "Unknown"
         
-        # Store Meta (Use API date for history training if available)
-        hist_date = api_date if api_date != "Unknown" else calc_date
-        game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': hist_date}
+        # --- FIXED DATE LOGIC ---
+        # 1. Try calculated time first
+        if dt_et:
+            date_et = dt_et.strftime('%Y-%m-%d')
+        # 2. If TBD, use the API's 'day' field
+        else:
+            api_day = g.get('day', '')
+            date_et = api_day.split('T')[0] if api_day else "Unknown"
 
-        # 3. BROAD MATCH: If EITHER date matches today, show it.
-        # This catches "Tomorrow UTC" games (7pm ET) AND "TBD" games.
-        if api_date == today_str or calc_date == today_str:
+        game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
+
+        # Filter for Selected Day
+        if date_et == today_str:
             if dt_et: g['et_datetime'] = dt_et
             else: g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d') + timedelta(hours=23, minutes=59)
             todays_games.append(g)
 
-    # --- 3. BUILD TRAINING MATRIX ---
+    # 3. TRAINING MATRIX
     matchups = []
     target_dt_obj = datetime.strptime(today_str, '%Y-%m-%d')
 
     for game in lines_json:
         lines = game.get('lines', [])
         if not lines: continue
-        s = lines[0].get('spread')
-        if s is None: continue
+        
+        # FIX: Check for None spread before converting
+        raw_spread = lines[0].get('spread')
+        if raw_spread is None: continue
+        s = float(raw_spread)
 
         home = get_team_name(game.get('homeTeam'))
         away = get_team_name(game.get('awayTeam'))
@@ -206,13 +224,16 @@ def run_analysis():
         try:
             g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
             days_ago = (target_dt_obj - g_date_obj).days
-            if days_ago <= 0: continue # Training on past games only
+            if days_ago <= 0: continue 
 
             weight = np.exp(-decay_alpha * days_ago)
             
-            adjusted_margin = -1 * float(s)
+            adjusted_margin = -1 * s
             if not meta['is_neutral']:
-                hca_to_remove = manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(home, 3.2)
+                if hca_mode == "Manual Slider":
+                    hca_to_remove = manual_hca
+                else:
+                    hca_to_remove = get_kenpom_hca(home, 3.2)
                 adjusted_margin -= hca_to_remove
             
             matchups.append({
@@ -221,25 +242,24 @@ def run_analysis():
         except: continue
 
     df = pd.DataFrame(matchups)
-    
     if df.empty:
         st.error(f"No past games found prior to {today_str} to train the model.")
         return
 
-    # --- 4. REGRESSION ---
-    h_dum = pd.get_dummies(df['Home'], dtype=int)
-    a_dum = pd.get_dummies(df['Away'], dtype=int)
-    all_teams = sorted(list(set(h_dum.columns) | set(a_dum.columns)))
+    # 4. REGRESSION
+    home_dummies = pd.get_dummies(df['Home'], dtype=int)
+    away_dummies = pd.get_dummies(df['Away'], dtype=int)
+    all_teams = sorted(list(set(home_dummies.columns) | set(away_dummies.columns)))
 
-    h_dum = h_dum.reindex(columns=all_teams, fill_value=0)
-    a_dum = a_dum.reindex(columns=all_teams, fill_value=0)
+    home_dummies = home_dummies.reindex(columns=all_teams, fill_value=0)
+    away_dummies = away_dummies.reindex(columns=all_teams, fill_value=0)
 
-    X = h_dum.sub(a_dum)
+    X = home_dummies.sub(away_dummies)
     y = df['Adjusted_Margin']
-    w_norm = df['Weight'].values
-
+    w_vals = df['Weight'].values
+    
     clf = Ridge(alpha=1.0, fit_intercept=False)
-    clf.fit(X, y, sample_weight=w_norm)
+    clf.fit(X, y, sample_weight=w_vals)
 
     coefs = pd.Series(clf.coef_, index=X.columns)
     market_ratings = coefs - coefs.mean()
@@ -251,46 +271,53 @@ def run_analysis():
     with st.expander("📊 View Power Ratings (Neutral Court)"):
         st.dataframe(ratings_df, height=300, use_container_width=True)
 
-    # --- 6. PROJECTIONS ---
+    # 5. PROJECTIONS
     st.subheader(f"Projections ({len(todays_games)} Games)")
     
     if not todays_games:
         st.info(f"No games scheduled for {today_str}.")
     else:
         todays_games.sort(key=lambda x: x['et_datetime'])
-        
-        # Cache line lookups for speed
-        lines_lookup = {}
-        for l in lines_json:
-            gid = str(l.get('gameId'))
-            if l.get('lines'): lines_lookup[gid] = float(l['lines'][0]['spread'])
-
         projections = []
+
         for g in todays_games:
             h = get_team_name(g.get('homeTeam'))
             a = get_team_name(g.get('awayTeam'))
             
             h_r = market_ratings.get(h, 0.0)
             a_r = market_ratings.get(a, 0.0)
-            
             is_neutral = g.get('neutralSite', False)
+
             if is_neutral: hca_val = 0.0
-            else: hca_val = manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(h, 3.2)
+            else:
+                if hca_mode == "Manual Slider": hca_val = manual_hca
+                else: hca_val = get_kenpom_hca(h, 3.2)
 
-            my_proj_spread = -1 * ((h_r - a_r) + hca_val)
+            raw_margin = (h_r - a_r) + hca_val
+            my_proj_spread = -1 * raw_margin
 
-            gid = str(g.get('id'))
-            vegas = lines_lookup.get(gid)
+            gid = g.get('id')
+            vegas = None
+            for l in lines_json:
+                if str(l.get('gameId')) == str(gid) and l.get('lines'):
+                    # FIX: Safely check spread existence
+                    v_raw = l['lines'][0].get('spread')
+                    if v_raw is not None:
+                        vegas = float(v_raw)
+                    break
             
             edge = 0.0
-            if vegas is not None: edge = vegas - my_proj_spread
+            if vegas is not None:
+                edge = vegas - my_proj_spread
 
             pick = ""
             if edge > 3.0: pick = f"BET {h}"
             elif edge < -3.0: pick = f"BET {a}"
             
+            t_str = g['et_datetime'].strftime('%I:%M %p') if g['et_datetime'] != "TBD" else "TBD"
+            
             projections.append({
-                'Time': g['et_datetime'].strftime('%I:%M %p'),
+                'Time': t_str,
                 'Matchup': f"{a} @ {h}",
                 'Home Rtg': round(h_r, 1),
                 'Away Rtg': round(a_r, 1),
