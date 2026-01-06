@@ -102,7 +102,6 @@ def get_team_name(team_obj):
 def utc_to_et(iso_date_str):
     """
     Standard format to convert UTC string to ET datetime object.
-    Only used for DISPLAY purposes now, not for filtering logic.
     """
     if not iso_date_str: return None
     try:
@@ -201,30 +200,37 @@ def run_analysis():
         a = get_team_name(g.get('awayTeam'))
         
         # --- ROBUST FILTERING ---
-        # Instead of parsing the start time to guess the day, 
-        # we rely on the API's 'day' field which is the official betting slate date.
         api_day = g.get('day', '') 
+        raw_start = g.get('startDate', '')
+
+        # 1. DETERMINE DATE FOR FILTERING
+        # Use 'day' if available (Best for Tomorrow's games)
+        # Fallback to 'startDate' if missing (Best for Past/Training games)
+        date_et = "Unknown"
         
-        # 'api_day' format is usually "2026-01-05T00:00:00.000Z"
-        # We just check if it starts with our selected date string (YYYY-MM-DD)
+        if api_day:
+            date_et = api_day.split('T')[0]
+        elif raw_start:
+            dt_et = utc_to_et(raw_start)
+            if dt_et:
+                date_et = dt_et.strftime('%Y-%m-%d')
+
+        game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
+
+        # 2. CHECK IF GAME IS "TODAY" (User Selected Date)
         is_today = False
         if api_day and api_day.startswith(today_str):
             is_today = True
-        
-        # Store meta for training data (using api_day for consistency)
-        date_et = api_day.split('T')[0] if api_day else "Unknown"
-        game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
-
+        elif not api_day and date_et == today_str:
+            is_today = True
+            
         # ADD TO LIST IF MATCH
         if is_today:
-            # Handle Display Time (Visuals Only)
-            raw_start = g.get('startDate', '')
-            dt_et = utc_to_et(raw_start)
-            
-            if dt_et:
-                g['et_datetime'] = dt_et
+            # Handle Display Time
+            dt_display = utc_to_et(raw_start)
+            if dt_display:
+                g['et_datetime'] = dt_display
             else:
-                # If time is missing/invalid, put at end of day
                 g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d') + timedelta(hours=23, minutes=59)
             
             todays_games.append(g)
