@@ -121,10 +121,10 @@ def get_kenpom_hca(api_name, default_hca):
             return KENPOM_HCA_DATA[try_name]
     return default_hca
 
-# --- DATA FETCHING (FULL SEASON) ---
-@st.cache_data(ttl=3600)
+# --- DATA FETCHING (NO CACHE FOR DEBUGGING) ---
+# I removed @st.cache_data to force a fresh pull.
+# Once it works, you can add it back.
 def fetch_data(year):
-    masked_key = API_KEY[:5] + "..." + API_KEY[-5:] if API_KEY else "None"
     with st.spinner(f'Fetching FULL season {year} data...'):
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
@@ -153,11 +153,7 @@ def run_analysis():
     
     # 3. HCA SOURCE TOGGLE
     hca_mode = st.sidebar.radio("HCA Source:", ["Manual Slider", "KenPom"], index=0)
-    if hca_mode == "Manual Slider":
-        manual_hca = st.sidebar.slider("Global HCA", 2.0, 5.0, 3.2, 0.1)
-    else:
-        st.sidebar.info("Using KenPom data.")
-        manual_hca = 3.2 
+    manual_hca = st.sidebar.slider("Global HCA", 2.0, 5.0, 3.2, 0.1) if hca_mode == "Manual Slider" else 3.2
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
@@ -165,52 +161,59 @@ def run_analysis():
     games_json, lines_json = fetch_data(YEAR)
     if not games_json: return
 
-    # --- 2. PREP DATA & FILTER FOR TODAY ---
+    # --- 2. PREP DATA & DIAGNOSTICS ---
     matchups_train = []
     target_games = []
-    target_dt_obj = datetime.strptime(today_str, '%Y-%m-%d')
     
-    debug_total_games = len(games_json)
-    debug_today_count = 0
-
+    # DIAGNOSTIC COUNTERS
+    date_counts = {}
+    
     # Build Map for Training
-    # Also filter "Target Games" locally here
     game_map = {}
     
     for g in games_json:
         h = get_team_name(g.get('homeTeam'))
         a = get_team_name(g.get('awayTeam'))
         
-        # --- ROBUST DATE LOGIC ---
-        # We calculate BOTH possible dates (API official day AND ET Calculated day)
-        # If EITHER matches 'today_str', we show it.
-        
-        api_day = g.get('day', '')
+        # --- STRICT TIMEZONE CALCULATION ---
+        # We rely 100% on the timestamp converted to ET.
         raw_start = g.get('startDate', '')
-        
-        date_api = api_day.split('T')[0] if api_day else "Unknown"
-        
         dt_et = utc_to_et(raw_start)
-        date_calc = dt_et.strftime('%Y-%m-%d') if dt_et else "Unknown"
         
-        # Determine strict date for Training History (prefer API day)
-        hist_date = date_api if date_api != "Unknown" else date_calc
+        if dt_et:
+            date_calc = dt_et.strftime('%Y-%m-%d')
+            # Count games per day for debugging
+            date_counts[date_calc] = date_counts.get(date_calc, 0) + 1
+        else:
+            date_calc = "Unknown"
         
         # Store metadata
-        game_map[f"{h}_{a}"] = {'date': hist_date, 'neutral': g.get('neutralSite', False)}
+        game_map[f"{h}_{a}"] = {'date': date_calc, 'neutral': g.get('neutralSite', False)}
 
-        # FILTER FOR DISPLAY ("Is this game today?")
-        is_today = False
-        if date_api == today_str: is_today = True
-        elif date_calc == today_str: is_today = True
-        
-        if is_today:
-            if dt_et: g['et_time'] = dt_et.strftime('%I:%M %p')
-            else: g['et_time'] = "TBD"
+        # FILTER FOR DISPLAY
+        if date_calc == today_str:
+            g['et_time'] = dt_et.strftime('%I:%M %p') if dt_et else "TBD"
             target_games.append(g)
-            debug_today_count += 1
+
+    # --- SIDEBAR DIAGNOSTICS (THE FIX) ---
+    with st.sidebar.expander("🕵️ Data Inspector (Check Here!)", expanded=True):
+        st.write(f"Total Games Fetched: {len(games_json)}")
+        st.write("Games found near selected date:")
+        
+        # Check surrounding days
+        target_dt = datetime.strptime(today_str, '%Y-%m-%d')
+        for i in range(-2, 3): # Check 2 days before and 2 days after
+            check_date = (target_dt + timedelta(days=i)).strftime('%Y-%m-%d')
+            count = date_counts.get(check_date, 0)
+            prefix = "👉 " if check_date == today_str else ""
+            st.write(f"{prefix}{check_date}: {count} games")
+            
+        if len(target_games) == 0:
+            st.error("No games match this date filter.")
 
     # --- 3. TRAIN MODEL (Using History) ---
+    target_dt_obj = datetime.strptime(today_str, '%Y-%m-%d')
+    
     for line in lines_json:
         s = line.get('lines', [])[0].get('spread') if line.get('lines') else None
         if s is None: continue
@@ -224,7 +227,7 @@ def run_analysis():
         try:
             g_date = datetime.strptime(meta['date'], '%Y-%m-%d')
             days_ago = (target_dt_obj - g_date).days
-            if days_ago <= 0: continue # Skip today/future for training
+            if days_ago <= 0: continue # Skip today/future
             
             weight = np.exp(-decay_alpha * days_ago)
             
