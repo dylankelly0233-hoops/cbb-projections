@@ -100,6 +100,10 @@ def get_team_name(team_obj):
     return str(team_obj)
 
 def utc_to_et(iso_date_str):
+    """
+    Standard format to convert UTC string to ET datetime object.
+    Only used for DISPLAY purposes now, not for filtering logic.
+    """
     if not iso_date_str: return None
     try:
         dt_utc = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
@@ -196,43 +200,32 @@ def run_analysis():
         h = get_team_name(g.get('homeTeam'))
         a = get_team_name(g.get('awayTeam'))
         
-        raw_start = g.get('startDate', '')
+        # --- ROBUST FILTERING ---
+        # Instead of parsing the start time to guess the day, 
+        # we rely on the API's 'day' field which is the official betting slate date.
+        api_day = g.get('day', '') 
         
-        # --- ROBUST DATE LOGIC ---
-        # 1. Trust the 'day' field first (YYYY-MM-DD) if available
-        # This solves the timezone shift because the API explicitly states the date.
-        api_day = g.get('day')
+        # 'api_day' format is usually "2026-01-05T00:00:00.000Z"
+        # We just check if it starts with our selected date string (YYYY-MM-DD)
+        is_today = False
+        if api_day and api_day.startswith(today_str):
+            is_today = True
         
-        dt_et = None
-        if raw_start:
-            dt_et = utc_to_et(raw_start)
-
-        if api_day:
-            # Usually strict YYYY-MM-DD, but sometimes has time attached. Split to be safe.
-            date_et = api_day.split('T')[0]
-        elif dt_et:
-            # Fallback: If 'day' is missing, check for the "Midnight UTC" signature
-            # 00:00 UTC = 19:00 EST (Previous Day). We want to reverse that if it's TBD.
-            if raw_start.endswith("00:00:00.000Z") or raw_start.endswith("T00:00:00Z"):
-                 # It is likely TBD. Use the raw date string from the API (ignoring timezone shift)
-                 date_et = raw_start.split('T')[0]
-            else:
-                 # Standard conversion for confirmed times
-                 date_et = dt_et.strftime('%Y-%m-%d')
-        else:
-            date_et = "Unknown"
-
+        # Store meta for training data (using api_day for consistency)
+        date_et = api_day.split('T')[0] if api_day else "Unknown"
         game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
 
-        # MATCHING LOGIC
-        if date_et == today_str:
+        # ADD TO LIST IF MATCH
+        if is_today:
+            # Handle Display Time (Visuals Only)
+            raw_start = g.get('startDate', '')
+            dt_et = utc_to_et(raw_start)
+            
             if dt_et:
                 g['et_datetime'] = dt_et
-                # Display time nicely. If it's 7 PM EST and we suspected TBD, mark it?
-                # For now, just show the time.
             else:
-                # Placeholder for truly unknown times so they sort to the bottom
-                g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d')
+                # If time is missing/invalid, put at end of day
+                g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d') + timedelta(hours=23, minutes=59)
             
             todays_games.append(g)
             debug_games_found += 1
@@ -405,4 +398,3 @@ def run_analysis():
 
 if __name__ == "__main__":
     run_analysis()
-
