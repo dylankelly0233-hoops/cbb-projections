@@ -10,7 +10,7 @@ import io
 st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
-# ⚠️ PASTE YOUR API KEY BELOW
+# ⚠️ PASTE YOUR NEW API KEY HERE
 API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo' 
 
 YEAR = 2026
@@ -99,15 +99,16 @@ def get_team_name(team_obj):
     if isinstance(team_obj, dict): return team_obj.get('name', 'Unknown')
     return str(team_obj)
 
+# 🚨 ORIGINAL LOGIC RESTORED (Prevents Ratings Shift)
+# We revert to defaulting to "now()" so missing dates don't break the model history
 def utc_to_et(iso_date_str):
-    # FIX: Return None if TBD, don't default to "Now"
-    if not iso_date_str: return None
+    if not iso_date_str: return datetime.now()
     try:
         dt_utc = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
         dt_et = dt_utc.astimezone(timezone(timedelta(hours=-5)))
         return dt_et
     except ValueError:
-        return None
+        return datetime.now()
 
 def get_kenpom_hca(api_name, default_hca):
     if api_name in KENPOM_HCA_DATA:
@@ -125,6 +126,7 @@ def get_kenpom_hca(api_name, default_hca):
 # --- DATA FETCHING ---
 @st.cache_data(ttl=3600)
 def fetch_api_data(year):
+    masked_key = API_KEY[:5] + "..." + API_KEY[-5:] if API_KEY else "None"
     with st.spinner(f'Fetching data for season {year}...'):
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
@@ -150,8 +152,8 @@ def fetch_api_data(year):
 
 # --- MAIN LOGIC ---
 def run_analysis():
+    # --- SIDEBAR ---
     st.sidebar.title("⚙️ Settings")
-    
     st.sidebar.subheader("📅 Date Selection")
     now_et = datetime.now(timezone(timedelta(hours=-5)))
     selected_date = st.sidebar.date_input("Target Date", now_et)
@@ -160,11 +162,7 @@ def run_analysis():
     decay_alpha = st.sidebar.slider("Decay Alpha", 0.000, 0.100, 0.035, 0.001, format="%.3f")
     
     hca_mode = st.sidebar.radio("Choose HCA Data:", ["Manual Slider", "KenPom (Static Table)"], index=0)
-    if hca_mode == "Manual Slider":
-        manual_hca = st.sidebar.slider("Global HCA Points", 2.0, 5.0, 3.2, 0.1)
-    else:
-        st.sidebar.info("Using KenPom Table data. If a team name doesn't match, it defaults to 3.2.")
-        manual_hca = 3.2 
+    manual_hca = st.sidebar.slider("Global HCA Points", 2.0, 5.0, 3.2, 0.1) if hca_mode == "Manual Slider" else 3.2
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
@@ -174,7 +172,7 @@ def run_analysis():
         st.warning("No data loaded.")
         return
 
-    # 2. PROCESS GAMES
+    # 2. PROCESS GAMES (HYBRID FIX APPLIED HERE)
     todays_games = []
     game_meta = {}
 
@@ -183,26 +181,26 @@ def run_analysis():
         a = get_team_name(g.get('awayTeam'))
         
         raw_start = g.get('startDate', '')
-        dt_et = utc_to_et(raw_start)
+        dt_et = utc_to_et(raw_start) # Uses original logic (Now if TBD)
         
-        # --- FIXED DATE LOGIC ---
-        # 1. Try calculated time first
-        if dt_et:
-            date_et = dt_et.strftime('%Y-%m-%d')
-        # 2. If TBD, use the API's 'day' field
-        else:
-            api_day = g.get('day', '')
-            date_et = api_day.split('T')[0] if api_day else "Unknown"
+        # --- FIX: BROAD MATCH FOR DATE ---
+        # We calculate two dates:
+        # A) The Calculated Time (might be off if TBD/Midnight)
+        calc_date = dt_et.strftime('%Y-%m-%d')
+        
+        # B) The Official API "Day" (Usually corrects TBD errors)
+        api_day = g.get('day', '')
+        api_date = api_day.split('T')[0] if api_day else "Unknown"
+        
+        # Store for training (Use Calc to match original rating logic)
+        game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': calc_date}
 
-        game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
-
-        # Filter for Selected Day
-        if date_et == today_str:
+        # Filter for Display: If EITHER matches, show it.
+        if calc_date == today_str or api_date == today_str:
             if dt_et: g['et_datetime'] = dt_et
-            else: g['et_datetime'] = datetime.strptime(today_str, '%Y-%m-%d') + timedelta(hours=23, minutes=59)
             todays_games.append(g)
 
-    # 3. TRAINING MATRIX
+    # 3. TRAINING MATRIX (UNCHANGED TO PRESERVE RATINGS)
     matchups = []
     target_dt_obj = datetime.strptime(today_str, '%Y-%m-%d')
 
@@ -210,7 +208,7 @@ def run_analysis():
         lines = game.get('lines', [])
         if not lines: continue
         
-        # FIX: Check for None spread before converting
+        # FIX: Crash Prevention
         raw_spread = lines[0].get('spread')
         if raw_spread is None: continue
         s = float(raw_spread)
@@ -219,27 +217,23 @@ def run_analysis():
         away = get_team_name(game.get('awayTeam'))
         meta = game_meta.get(f"{home}_{away}")
         
-        if not meta or meta['date_et'] == "Unknown": continue
+        if not meta: continue
 
-        try:
-            g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
-            days_ago = (target_dt_obj - g_date_obj).days
-            if days_ago <= 0: continue 
+        g_date_obj = datetime.strptime(meta['date_et'], '%Y-%m-%d')
+        days_ago = (target_dt_obj - g_date_obj).days
 
-            weight = np.exp(-decay_alpha * days_ago)
-            
-            adjusted_margin = -1 * s
-            if not meta['is_neutral']:
-                if hca_mode == "Manual Slider":
-                    hca_to_remove = manual_hca
-                else:
-                    hca_to_remove = get_kenpom_hca(home, 3.2)
-                adjusted_margin -= hca_to_remove
-            
-            matchups.append({
-                'Home': home, 'Away': away, 'Adjusted_Margin': adjusted_margin, 'Weight': weight
-            })
-        except: continue
+        if days_ago < 0: continue 
+
+        weight = np.exp(-decay_alpha * days_ago)
+        
+        adjusted_margin = -1 * s
+        if not meta['is_neutral']:
+            hca_to_remove = manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(home, 3.2)
+            adjusted_margin -= hca_to_remove
+        
+        matchups.append({
+            'Home': home, 'Away': away, 'Adjusted_Margin': adjusted_margin, 'Weight': weight
+        })
 
     df = pd.DataFrame(matchups)
     if df.empty:
@@ -269,7 +263,7 @@ def run_analysis():
     ratings_df.index += 1
     
     with st.expander("📊 View Power Ratings (Neutral Court)"):
-        st.dataframe(ratings_df, height=300, use_container_width=True)
+        st.dataframe(ratings_df.head(362), height=300, use_container_width=True)
 
     # 5. PROJECTIONS
     st.subheader(f"Projections ({len(todays_games)} Games)")
@@ -289,9 +283,7 @@ def run_analysis():
             is_neutral = g.get('neutralSite', False)
 
             if is_neutral: hca_val = 0.0
-            else:
-                if hca_mode == "Manual Slider": hca_val = manual_hca
-                else: hca_val = get_kenpom_hca(h, 3.2)
+            else: hca_val = manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(h, 3.2)
 
             raw_margin = (h_r - a_r) + hca_val
             my_proj_spread = -1 * raw_margin
@@ -300,7 +292,7 @@ def run_analysis():
             vegas = None
             for l in lines_json:
                 if str(l.get('gameId')) == str(gid) and l.get('lines'):
-                    # FIX: Safely check spread existence
+                    # FIX: Crash Prevention here too
                     v_raw = l['lines'][0].get('spread')
                     if v_raw is not None:
                         vegas = float(v_raw)
@@ -314,7 +306,11 @@ def run_analysis():
             if edge > 3.0: pick = f"BET {h}"
             elif edge < -3.0: pick = f"BET {a}"
             
-            t_str = g['et_datetime'].strftime('%I:%M %p') if g['et_datetime'] != "TBD" else "TBD"
+            # TBD Check for display
+            t_str = g['et_datetime'].strftime('%I:%M %p')
+            if g['et_datetime'].hour == 0 and g['et_datetime'].minute == 0 and g['et_datetime'].second == 0:
+                 # If exact midnight, it might be TBD, but let's just show the time to be safe
+                 pass 
             
             projections.append({
                 'Time': t_str,
