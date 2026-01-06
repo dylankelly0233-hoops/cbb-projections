@@ -287,7 +287,7 @@ def run_analysis():
     ratings_df.index += 1
     
     with st.expander("📊 View Power Ratings (Neutral Court)"):
-        st.dataframe(ratings_df.head(25), height=300, use_container_width=True)
+        st.dataframe(ratings_df.head(362), height=300, use_container_width=True)
 
     # --- 6. PROJECTIONS ---
     st.subheader(f"Projections")
@@ -371,3 +371,4 @@ def run_analysis():
 
 if __name__ == "__main__":
     run_analysis()
+
