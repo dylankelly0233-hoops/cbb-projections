@@ -10,15 +10,12 @@ import io
 st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
-# ⚠️ PASTE YOUR NEW API KEY HERE
 API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
-
-# CHECK: If you get no data, try changing YEAR to 2025 (some APIs treat the 25-26 season as 2025)
 YEAR = 2026 
 BASE_URL = 'https://api.collegebasketballdata.com'
 HEADERS = {'Authorization': f'Bearer {API_KEY}', 'accept': 'application/json'}
 
-# --- KENPOM DATA (Cleaned & Processed) ---
+# --- KENPOM DATA ---
 KENPOM_HCA_DATA = {
     "West Virginia": 4.5, "TCU": 4.5, "Utah": 4.5, "New Mexico": 4.3, "Wake Forest": 4.2,
     "Texas Tech": 4.2, "Oklahoma": 4.1, "Utah St.": 4.1, "BYU": 4.1, "Rutgers": 4.0,
@@ -103,16 +100,13 @@ def get_team_name(team_obj):
 def utc_to_et(iso_date_str):
     if not iso_date_str: return datetime.now()
     try:
-        # Robust parsing for ISO strings with or without Z
         date_str = iso_date_str.replace('Z', '+00:00')
         dt_utc = datetime.fromisoformat(date_str)
-        # Convert to ET (UTC-5 fixed for simplicity, or use pytz if available)
         dt_et = dt_utc.astimezone(timezone(timedelta(hours=-5)))
         return dt_et
     except ValueError:
         return datetime.now()
 
-# 🛠️ SMART LOOKUP FOR KENPOM NAMES
 def get_kenpom_hca(api_name, default_hca):
     if api_name in KENPOM_HCA_DATA: return KENPOM_HCA_DATA[api_name]
     if "State" in api_name:
@@ -123,7 +117,6 @@ def get_kenpom_hca(api_name, default_hca):
         if try_name in KENPOM_HCA_DATA: return KENPOM_HCA_DATA[try_name]
     return default_hca 
 
-# --- DATA FETCHING ---
 @st.cache_data(ttl=3600)
 def fetch_api_data(year):
     with st.spinner(f'Fetching data for season {year}...'):
@@ -153,35 +146,55 @@ def fetch_api_data(year):
 def run_analysis():
     # --- SIDEBAR CONTROLS ---
     st.sidebar.title("⚙️ Settings")
-    
     st.sidebar.subheader("📅 Date Selection")
     now_et = datetime.now(timezone(timedelta(hours=-5)))
     selected_date = st.sidebar.date_input("Target Date", now_et)
     today_str = selected_date.strftime('%Y-%m-%d')
-
     decay_alpha = st.sidebar.slider("Decay Alpha", 0.000, 0.100, 0.035, 0.001, format="%.3f")
-    
     st.sidebar.subheader("🏟️ Home Court Source")
-    hca_mode = st.sidebar.radio(
-        "Choose HCA Data:",
-        ["Manual Slider", "KenPom (Static Table)"],
-        index=0
-    )
-
+    hca_mode = st.sidebar.radio("Choose HCA Data:", ["Manual Slider", "KenPom (Static Table)"], index=0)
+    
     if hca_mode == "Manual Slider":
         manual_hca = st.sidebar.slider("Global HCA Points", 2.0, 5.0, 3.2, 0.1)
     else:
-        st.sidebar.info("Using KenPom Table data. If a team name doesn't match, it defaults to 3.2.")
+        st.sidebar.info("Using KenPom Table data.")
         manual_hca = 3.2 
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
     # --- 1. FETCH DATA ---
     games_json, lines_json = fetch_api_data(YEAR)
-    
     if not games_json:
-        st.warning("No data loaded. Please check API Key or Season Year.")
+        st.warning("No data loaded.")
         return
+
+    # --- DIAGNOSTIC TOOL (NEW) ---
+    with st.expander("🛠️ System Diagnostics (Click here if no games appear)"):
+        st.write(f"**Selected Date:** {today_str}")
+        st.write(f"**Total Games Loaded:** {len(games_json)}")
+        
+        # Collect all dates found in the data
+        found_dates = set()
+        for g in games_json:
+            raw = g.get('startDate', '')
+            dt = utc_to_et(raw)
+            found_dates.add(dt.strftime('%Y-%m-%d'))
+        
+        # Sort and show the last few dates
+        sorted_dates = sorted(list(found_dates))
+        if sorted_dates:
+            st.write("**Range of dates found in API data:**")
+            st.write(f"First Date: {sorted_dates[0]}")
+            st.write(f"Last Date: {sorted_dates[-1]}")
+            st.write("**Last 5 Dates Available:**")
+            st.write(sorted_dates[-5:])
+            
+            if today_str in found_dates:
+                st.success(f"✅ Data for {today_str} IS present in the database.")
+            else:
+                st.error(f"❌ Data for {today_str} is NOT in the database. The API might have a delay or cutoff.")
+        else:
+            st.error("No valid dates found in game data.")
 
     # --- 2. PROCESS GAMES (SCHEDULE) ---
     todays_games = []
@@ -196,6 +209,7 @@ def run_analysis():
 
         game_meta[f"{h}_{a}"] = {'is_neutral': g.get('neutralSite', False), 'date_et': date_et}
 
+        # LOOSER MATCHING: Check string match
         if date_et == today_str:
             g['et_datetime'] = dt_et
             todays_games.append(g)
@@ -203,14 +217,7 @@ def run_analysis():
     # --- 3. BUILD TRAINING MATRIX ---
     matchups = []
     target_dt_obj = datetime.strptime(today_str, '%Y-%m-%d')
-
-    # Create a quick lookup for lines to speed up processing
-    # Key = Game ID (as string), Value = Line Object
-    lines_map = {}
-    for l in lines_json:
-        gid = str(l.get('gameId', ''))
-        if gid and l.get('lines'):
-            lines_map[gid] = l
+    lines_map = {str(l.get('gameId', '')): l for l in lines_json if l.get('gameId')}
 
     for game in lines_json:
         lines = game.get('lines', [])
@@ -230,16 +237,10 @@ def run_analysis():
         if days_ago < 0: continue 
 
         weight = np.exp(-decay_alpha * days_ago)
-        
-        # --- PRE-BAKE HCA LOGIC ---
         adjusted_margin = -1 * float(s)
         
         if not meta['is_neutral']:
-            if hca_mode == "Manual Slider":
-                hca_to_remove = manual_hca
-            else:
-                hca_to_remove = get_kenpom_hca(home, 3.2)
-            
+            hca_to_remove = manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(home, 3.2)
             adjusted_margin -= hca_to_remove
         
         matchups.append({
@@ -249,16 +250,14 @@ def run_analysis():
         })
 
     df = pd.DataFrame(matchups)
-    
     if df.empty:
-        st.error(f"No past games found prior to {today_str} to train the model. Check season year.")
+        st.error(f"No past games found prior to {today_str} to train the model.")
         return
 
     # --- 4. REGRESSION ---
     home_dummies = pd.get_dummies(df['Home'], dtype=int)
     away_dummies = pd.get_dummies(df['Away'], dtype=int)
     all_teams = sorted(list(set(home_dummies.columns) | set(away_dummies.columns)))
-
     home_dummies = home_dummies.reindex(columns=all_teams, fill_value=0)
     away_dummies = away_dummies.reindex(columns=all_teams, fill_value=0)
 
@@ -270,11 +269,10 @@ def run_analysis():
     clf = Ridge(alpha=1.0, fit_intercept=False)
     clf.fit(X, y, sample_weight=w_norm)
 
-    # --- 5. EXTRACT RATINGS ---
     coefs = pd.Series(clf.coef_, index=X.columns)
     market_ratings = coefs - coefs.mean()
 
-    # Display Top 25
+    # --- 5. DISPLAY RATINGS ---
     ratings_df = pd.DataFrame({'Team': market_ratings.index, 'Rating': market_ratings.values})
     ratings_df = ratings_df.sort_values('Rating', ascending=False).reset_index(drop=True)
     ratings_df.index += 1
@@ -286,7 +284,7 @@ def run_analysis():
     st.subheader(f"Projections")
     
     if not todays_games:
-        st.info(f"No games scheduled for {today_str}. (Games Loaded Total: {len(games_json)})")
+        st.info(f"No games scheduled for {today_str}. Check the 'System Diagnostics' above to see available dates.")
     else:
         todays_games.sort(key=lambda x: x['et_datetime'])
         projections = []
@@ -294,41 +292,24 @@ def run_analysis():
         for g in todays_games:
             h = get_team_name(g.get('homeTeam'))
             a = get_team_name(g.get('awayTeam'))
-            
             h_r = market_ratings.get(h, 0.0)
             a_r = market_ratings.get(a, 0.0)
             is_neutral = g.get('neutralSite', False)
 
-            # APPLY HCA FOR PREDICTION
-            if is_neutral:
-                hca_val = 0.0
-            else:
-                if hca_mode == "Manual Slider":
-                    hca_val = manual_hca
-                else:
-                    hca_val = get_kenpom_hca(h, 3.2)
-
+            hca_val = 0.0 if is_neutral else (manual_hca if hca_mode == "Manual Slider" else get_kenpom_hca(h, 3.2))
             raw_margin = (h_r - a_r) + hca_val
             my_proj_spread = -1 * raw_margin
 
             gid = str(g.get('id'))
             vegas = None
-            
-            # --- FASTER LOOKUP ---
             if gid in lines_map:
                 l_obj = lines_map[gid]
                 if l_obj.get('lines'):
                     s = l_obj['lines'][0].get('spread')
-                    if s is not None:
-                        vegas = float(s)
+                    if s is not None: vegas = float(s)
             
-            edge = 0.0
-            if vegas is not None:
-                edge = vegas - my_proj_spread
-
-            pick = ""
-            if edge > 3.0: pick = f"BET {h}"
-            elif edge < -3.0: pick = f"BET {a}"
+            edge = vegas - my_proj_spread if vegas is not None else 0.0
+            pick = f"BET {h}" if edge > 3.0 else (f"BET {a}" if edge < -3.0 else "")
             
             projections.append({
                 'Time': g['et_datetime'].strftime('%I:%M %p'),
@@ -343,16 +324,11 @@ def run_analysis():
             })
             
         proj_df = pd.DataFrame(projections)
-
         def highlight_picks(val):
-            color = ''
-            if 'BET' in str(val):
-                color = 'background-color: #90EE90; color: black; font-weight: bold'
-            return color
+            return 'background-color: #90EE90; color: black; font-weight: bold' if 'BET' in str(val) else ''
 
         st.dataframe(proj_df.style.applymap(highlight_picks, subset=['Pick']), use_container_width=True)
 
-        # Excel Export
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             ratings_df.to_excel(writer, sheet_name='Ratings')
