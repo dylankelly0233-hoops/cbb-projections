@@ -5,7 +5,6 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from sklearn.linear_model import Ridge
 import io
-import re
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="CBB Projections", layout="wide")
@@ -14,7 +13,8 @@ st.set_page_config(page_title="CBB Projections", layout="wide")
 # ⚠️ PASTE YOUR NEW API KEY HERE
 API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
 
-YEAR = 2026
+# CHECK: If you get no data, try changing YEAR to 2025 (some APIs treat the 25-26 season as 2025)
+YEAR = 2026 
 BASE_URL = 'https://api.collegebasketballdata.com'
 HEADERS = {'Authorization': f'Bearer {API_KEY}', 'accept': 'application/json'}
 
@@ -103,7 +103,10 @@ def get_team_name(team_obj):
 def utc_to_et(iso_date_str):
     if not iso_date_str: return datetime.now()
     try:
-        dt_utc = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
+        # Robust parsing for ISO strings with or without Z
+        date_str = iso_date_str.replace('Z', '+00:00')
+        dt_utc = datetime.fromisoformat(date_str)
+        # Convert to ET (UTC-5 fixed for simplicity, or use pytz if available)
         dt_et = dt_utc.astimezone(timezone(timedelta(hours=-5)))
         return dt_et
     except ValueError:
@@ -111,32 +114,18 @@ def utc_to_et(iso_date_str):
 
 # 🛠️ SMART LOOKUP FOR KENPOM NAMES
 def get_kenpom_hca(api_name, default_hca):
-    # 1. Try Exact Match
-    if api_name in KENPOM_HCA_DATA:
-        return KENPOM_HCA_DATA[api_name]
-    
-    # 2. Try Standardizing "State" to "St." (KenPom likes St.)
+    if api_name in KENPOM_HCA_DATA: return KENPOM_HCA_DATA[api_name]
     if "State" in api_name:
         try_name = api_name.replace("State", "St.")
-        if try_name in KENPOM_HCA_DATA:
-            return KENPOM_HCA_DATA[try_name]
-            
-    # 3. Try Removing "St." to "State" (Just in case)
+        if try_name in KENPOM_HCA_DATA: return KENPOM_HCA_DATA[try_name]
     if "St." in api_name:
         try_name = api_name.replace("St.", "State")
-        if try_name in KENPOM_HCA_DATA:
-            return KENPOM_HCA_DATA[try_name]
-
-    # 4. Try removing "University" or common suffixes
-    # (Add more rules here if you notice specific teams missing)
-    
-    return default_hca # Fallback if not found
+        if try_name in KENPOM_HCA_DATA: return KENPOM_HCA_DATA[try_name]
+    return default_hca 
 
 # --- DATA FETCHING ---
 @st.cache_data(ttl=3600)
 def fetch_api_data(year):
-    masked_key = API_KEY[:5] + "..." + API_KEY[-5:] if API_KEY else "None"
-    
     with st.spinner(f'Fetching data for season {year}...'):
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year})
@@ -165,16 +154,13 @@ def run_analysis():
     # --- SIDEBAR CONTROLS ---
     st.sidebar.title("⚙️ Settings")
     
-    # 1. Date Selector
     st.sidebar.subheader("📅 Date Selection")
     now_et = datetime.now(timezone(timedelta(hours=-5)))
     selected_date = st.sidebar.date_input("Target Date", now_et)
     today_str = selected_date.strftime('%Y-%m-%d')
 
-    # 2. Decay Setting
     decay_alpha = st.sidebar.slider("Decay Alpha", 0.000, 0.100, 0.035, 0.001, format="%.3f")
     
-    # 3. HCA SOURCE TOGGLE
     st.sidebar.subheader("🏟️ Home Court Source")
     hca_mode = st.sidebar.radio(
         "Choose HCA Data:",
@@ -186,7 +172,7 @@ def run_analysis():
         manual_hca = st.sidebar.slider("Global HCA Points", 2.0, 5.0, 3.2, 0.1)
     else:
         st.sidebar.info("Using KenPom Table data. If a team name doesn't match, it defaults to 3.2.")
-        manual_hca = 3.2 # Fallback default
+        manual_hca = 3.2 
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
@@ -194,10 +180,10 @@ def run_analysis():
     games_json, lines_json = fetch_api_data(YEAR)
     
     if not games_json:
-        st.warning("No data loaded.")
+        st.warning("No data loaded. Please check API Key or Season Year.")
         return
 
-    # --- 2. PROCESS GAMES ---
+    # --- 2. PROCESS GAMES (SCHEDULE) ---
     todays_games = []
     game_meta = {}
 
@@ -217,6 +203,14 @@ def run_analysis():
     # --- 3. BUILD TRAINING MATRIX ---
     matchups = []
     target_dt_obj = datetime.strptime(today_str, '%Y-%m-%d')
+
+    # Create a quick lookup for lines to speed up processing
+    # Key = Game ID (as string), Value = Line Object
+    lines_map = {}
+    for l in lines_json:
+        gid = str(l.get('gameId', ''))
+        if gid and l.get('lines'):
+            lines_map[gid] = l
 
     for game in lines_json:
         lines = game.get('lines', [])
@@ -241,7 +235,6 @@ def run_analysis():
         adjusted_margin = -1 * float(s)
         
         if not meta['is_neutral']:
-            # DETERMINE HCA TO SUBTRACT
             if hca_mode == "Manual Slider":
                 hca_to_remove = manual_hca
             else:
@@ -258,7 +251,7 @@ def run_analysis():
     df = pd.DataFrame(matchups)
     
     if df.empty:
-        st.error(f"No past games found prior to {today_str} to train the model.")
+        st.error(f"No past games found prior to {today_str} to train the model. Check season year.")
         return
 
     # --- 4. REGRESSION ---
@@ -293,7 +286,7 @@ def run_analysis():
     st.subheader(f"Projections")
     
     if not todays_games:
-        st.info(f"No games scheduled for {today_str}.")
+        st.info(f"No games scheduled for {today_str}. (Games Loaded Total: {len(games_json)})")
     else:
         todays_games.sort(key=lambda x: x['et_datetime'])
         projections = []
@@ -318,13 +311,16 @@ def run_analysis():
             raw_margin = (h_r - a_r) + hca_val
             my_proj_spread = -1 * raw_margin
 
-            gid = g.get('id')
+            gid = str(g.get('id'))
             vegas = None
-            for l in lines_json:
-                if str(l.get('gameId')) == str(gid) and l.get('lines'):
-                    s = l['lines'][0].get('spread')
-                    if s is not None: vegas = float(s)
-                    break
+            
+            # --- FASTER LOOKUP ---
+            if gid in lines_map:
+                l_obj = lines_map[gid]
+                if l_obj.get('lines'):
+                    s = l_obj['lines'][0].get('spread')
+                    if s is not None:
+                        vegas = float(s)
             
             edge = 0.0
             if vegas is not None:
@@ -371,4 +367,3 @@ def run_analysis():
 
 if __name__ == "__main__":
     run_analysis()
-
