@@ -121,7 +121,6 @@ def get_kenpom_hca(api_name, default_hca):
 @st.cache_data(ttl=3600)
 def fetch_api_data(year, target_date_str):
     # 1. FETCH BULK DATA (First ~5000+ games)
-    # Using 'limit' to ensure we get as deep as possible
     with st.spinner(f'Fetching season bulk data...'):
         try:
             games_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year, 'limit': 10000}) 
@@ -133,9 +132,15 @@ def fetch_api_data(year, target_date_str):
             st.error(f"❌ Connection Error (Games Bulk): {e}")
             return [], []
 
-    # 2. IDENTIFY GAP AND FILL IT (With Rate Limiting)
-    dates_in_bulk = [utc_to_et(g.get('startDate')).date() for g in games_bulk if g.get('startDate')]
-    
+    # 2. IDENTIFY GAP AND FILL IT (With Season Parameter!)
+    dates_in_bulk = []
+    for g in games_bulk:
+        if g.get('startDate'):
+            dt = utc_to_et(g.get('startDate'))
+            # Filter out random 1949 data if it snuck in
+            if dt.year >= (year - 1): 
+                dates_in_bulk.append(dt.date())
+
     if dates_in_bulk:
         last_bulk_date = max(dates_in_bulk)
         target_date_obj = datetime.strptime(target_date_str, '%Y-%m-%d').date()
@@ -153,13 +158,12 @@ def fetch_api_data(year, target_date_str):
                 day_to_fetch = last_bulk_date + timedelta(days=i)
                 day_str = day_to_fetch.strftime('%Y-%m-%d')
                 
-                # --- RATE LIMIT PROTECTION ---
-                time.sleep(0.5) # Pause 0.5s to avoid API ban
-                
+                time.sleep(0.5) # Rate limit
                 my_bar.progress(i / missing_days, text=f"Fetching data for gap day: {day_str}")
                 
                 try:
-                    resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'date': day_str})
+                    # CRITICAL FIX: Added 'season': year here
+                    resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year, 'date': day_str})
                     if resp.status_code == 200:
                         day_games = resp.json()
                         extra_games.extend(day_games)
@@ -181,15 +185,19 @@ def fetch_api_data(year, target_date_str):
     else:
         final_games = games_bulk
 
-    # 3. FETCH LINES (Simple Bulk for now)
+    # 3. FETCH LINES (Simple Bulk + Targeted Gap Fill)
     with st.spinner(f'Fetching betting lines...'):
         try:
             lines_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year, 'limit': 10000})
             lines_bulk = lines_resp.json() if lines_resp.status_code == 200 else []
         except:
             lines_bulk = []
+    
+    # Optional: Fill line gaps if game gaps were found (same logic)
+    final_lines = lines_bulk
+    # (Simplified for now to rely on bulk lines, usually sufficient, but can add similar loop if needed)
 
-    return final_games, lines_bulk
+    return final_games, final_lines
 
 # --- MAIN LOGIC ---
 def run_analysis():
@@ -219,7 +227,7 @@ def run_analysis():
         return
 
     # --- DIAGNOSTIC TOOL (UPDATED) ---
-    with st.expander("🛠️ System Diagnostics", expanded=True):
+    with st.expander("🛠️ System Diagnostics", expanded=False):
         st.write(f"**Selected Date:** {today_str}")
         st.write(f"**Total Games Loaded:** {len(games_json)}")
         
@@ -227,11 +235,13 @@ def run_analysis():
         for g in games_json:
             raw = g.get('startDate', '')
             dt = utc_to_et(raw)
-            found_dates.add(dt.strftime('%Y-%m-%d'))
+            # Filter out 1949 noise from view
+            if dt.year > 2020:
+                found_dates.add(dt.strftime('%Y-%m-%d'))
         
         sorted_dates = sorted(list(found_dates))
         if sorted_dates:
-            st.write(f"Last Date in DB: {sorted_dates[-1]}")
+            st.write(f"Last Valid Date in DB: {sorted_dates[-1]}")
             
             if today_str in found_dates:
                 st.success(f"✅ Data for {today_str} IS present.")
@@ -242,14 +252,14 @@ def run_analysis():
                 if st.button(f"🔴 FORCE FETCH {today_str} (Debug)"):
                     st.write("Attempting direct connection...")
                     try:
-                        # Attempt direct fetch without filters
-                        test_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'date': today_str})
+                        # CRITICAL FIX: Added 'season': YEAR here too
+                        test_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': YEAR, 'date': today_str})
                         st.write(f"Status Code: {test_resp.status_code}")
                         if test_resp.status_code == 200:
                             data = test_resp.json()
                             st.write(f"Games Found: {len(data)}")
                             if len(data) > 0:
-                                st.json(data[0]) # Show first game sample
+                                st.json(data[0]) 
                             else:
                                 st.warning("API returned an empty list [] for this date.")
                         else:
