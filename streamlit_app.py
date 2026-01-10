@@ -155,7 +155,6 @@ def fetch_api_data(year):
             pass
             
         # Fetch Lines for this Conference
-        # (Note: Some APIs might not filter lines by conf, but we try to keep it granular)
         try:
             l_resp = requests.get(f"{BASE_URL}/lines", headers=HEADERS, params={'season': year, 'conference': conf_abbr})
             if l_resp.status_code == 200:
@@ -178,11 +177,14 @@ def fetch_api_data(year):
 def run_analysis():
     # --- SIDEBAR CONTROLS ---
     st.sidebar.title("⚙️ Settings")
-    st.sidebar.subheader("📅 Date Selection")
+    
+    # 1. Date & HCA Controls
+    st.sidebar.subheader("📅 Model Parameters")
     now_et = datetime.now(timezone(timedelta(hours=-5)))
     selected_date = st.sidebar.date_input("Target Date", now_et)
     today_str = selected_date.strftime('%Y-%m-%d')
-    decay_alpha = st.sidebar.slider("Decay Alpha", 0.000, 0.100, 0.035, 0.001, format="%.3f")
+    decay_alpha = st.sidebar.slider("Decay Alpha (Recency Bias)", 0.000, 0.100, 0.035, 0.001, format="%.3f")
+    
     st.sidebar.subheader("🏟️ Home Court Source")
     hca_mode = st.sidebar.radio("Choose HCA Data:", ["Manual Slider", "KenPom (Static Table)"], index=0)
     
@@ -191,6 +193,13 @@ def run_analysis():
     else:
         st.sidebar.info("Using KenPom Table data.")
         manual_hca = 3.2 
+
+    # 2. NEW: Betting Logic Controls
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💰 Betting Logic")
+    st.sidebar.write("Dynamic Threshold = Base + (Spread × Factor)")
+    base_threshold = st.sidebar.number_input("Base Threshold (Points)", value=2.0, step=0.5)
+    spread_factor = st.sidebar.slider("Volatility Factor (% of Spread)", 0.00, 0.15, 0.05, 0.01)
 
     st.title(f"🏀 CBB Projections: {today_str}")
 
@@ -333,8 +342,19 @@ def run_analysis():
                     s = l_obj['lines'][0].get('spread')
                     if s is not None: vegas = float(s)
             
+            # --- NEW DYNAMIC THRESHOLD LOGIC ---
             edge = vegas - my_proj_spread if vegas is not None else 0.0
-            pick = f"BET {h}" if edge > 3.0 else (f"BET {a}" if edge < -3.0 else "")
+            
+            # Calculate required threshold based on the magnitude of the spread
+            current_spread_mag = abs(vegas) if vegas is not None else 0
+            required_threshold = base_threshold + (current_spread_mag * spread_factor)
+            
+            pick = ""
+            if vegas is not None:
+                if edge > required_threshold:
+                    pick = f"BET {h} ({edge:.1f} > {required_threshold:.1f})"
+                elif edge < -required_threshold:
+                    pick = f"BET {a} ({abs(edge):.1f} > {required_threshold:.1f})"
             
             projections.append({
                 'Time': g['et_datetime'].strftime('%I:%M %p'),
@@ -344,13 +364,17 @@ def run_analysis():
                 'My Spread': round(my_proj_spread, 1),
                 'Vegas': vegas if vegas is not None else "N/A",
                 'Edge': round(edge, 1),
+                'Threshold': round(required_threshold, 1),
                 'Pick': pick,
                 'HCA Used': round(hca_val, 1)
             })
             
         proj_df = pd.DataFrame(projections)
+        
         def highlight_picks(val):
-            return 'background-color: #90EE90; color: black; font-weight: bold' if 'BET' in str(val) else ''
+            if 'BET' in str(val):
+                return 'background-color: #90EE90; color: black; font-weight: bold'
+            return ''
 
         st.dataframe(proj_df.style.applymap(highlight_picks, subset=['Pick']), use_container_width=True)
 
