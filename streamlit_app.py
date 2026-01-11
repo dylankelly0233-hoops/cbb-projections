@@ -11,7 +11,9 @@ import time
 st.set_page_config(page_title="CBB Projections", layout="wide")
 
 # --- CONFIGURATION ---
-API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo'
+# ⚠️ REPLACE 'YOUR_API_KEY_HERE' WITH YOUR ACTUAL KEY
+# I removed it for security since the previous one was posted publicly.
+API_KEY = 'YOUR_API_KEY_HERE' 
 YEAR = 2026 
 BASE_URL = 'https://api.collegebasketballdata.com'
 HEADERS = {'Authorization': f'Bearer {API_KEY}', 'accept': 'application/json'}
@@ -120,23 +122,47 @@ def get_kenpom_hca(api_name, default_hca):
 
 @st.cache_data(ttl=3600)
 def fetch_api_data(year):
+    # FALLBACK DATA: If the "Conferences" endpoint fails, use these so the app doesn't crash
+    fallback_conferences = [
+        {'abbreviation': 'ACC'}, {'abbreviation': 'B12'}, 
+        {'abbreviation': 'B10'}, {'abbreviation': 'SEC'}, 
+        {'abbreviation': 'BE'}, {'abbreviation': 'P12'}, 
+        {'abbreviation': 'MWC'}, {'abbreviation': 'WCC'},
+        {'abbreviation': 'AAC'}, {'abbreviation': 'A10'}
+    ]
+
     # 1. FETCH CONFERENCES
+    conferences = []
     with st.spinner('Initializing: Fetching conference list...'):
         try:
             conf_resp = requests.get(f"{BASE_URL}/conferences", headers=HEADERS)
-            if conf_resp.status_code != 200:
-                st.error("Failed to load conferences.")
-                return [], []
-            conferences = conf_resp.json()
-        except:
-            return [], []
+            
+            # --- DEBUGGING / FALLBACK LOGIC ---
+            if conf_resp.status_code == 200:
+                conferences = conf_resp.json()
+            else:
+                st.warning(f"⚠️ Warning: Could not load full conference list (API Status: {conf_resp.status_code}). Using Fallback list.")
+                # Print specific error details if possible
+                try:
+                    st.write(f"API Error Message: {conf_resp.text}")
+                except:
+                    pass
+                conferences = fallback_conferences
+        except Exception as e:
+            st.error(f"❌ Connection Error loading conferences: {e}")
+            st.info("Attempting to proceed with Fallback list...")
+            conferences = fallback_conferences
 
     # 2. LOOP FETCH BY CONFERENCE (Bypass 3000 limit)
     all_games = []
     all_lines = []
     
+    if not conferences:
+        st.error("Critical Error: No conferences loaded.")
+        return [], []
+
     # Progress Bar configuration
-    prog_text = "Fetching full season data by conference (Bypassing API limits)..."
+    prog_text = "Fetching full season data by conference..."
     my_bar = st.progress(0, text=prog_text)
     total_confs = len(conferences)
     
@@ -151,6 +177,9 @@ def fetch_api_data(year):
             g_resp = requests.get(f"{BASE_URL}/games", headers=HEADERS, params={'season': year, 'conference': conf_abbr})
             if g_resp.status_code == 200:
                 all_games.extend(g_resp.json())
+            elif g_resp.status_code == 429:
+                st.warning(f"⚠️ Rate Limit Hit on {conf_abbr}. Slowing down...")
+                time.sleep(2) # Penalty wait
         except:
             pass
             
@@ -162,8 +191,8 @@ def fetch_api_data(year):
         except:
             pass
         
-        # Short sleep to be nice to API
-        time.sleep(0.1)
+        # INCREASED SLEEP TO PREVENT 429 ERRORS
+        time.sleep(0.5) 
 
     my_bar.empty()
     
@@ -207,7 +236,7 @@ def run_analysis():
     games_json, lines_json = fetch_api_data(YEAR)
     
     if not games_json:
-        st.warning("No data loaded.")
+        st.warning("No data loaded. Check the API connection or Key.")
         return
 
     # --- DIAGNOSTIC TOOL ---
@@ -392,4 +421,3 @@ def run_analysis():
 
 if __name__ == "__main__":
     run_analysis()
-
