@@ -13,7 +13,7 @@ st.set_page_config(page_title="CBB Projections", layout="wide")
 # --- CONFIGURATION ---
 # ⚠️ REPLACE 'YOUR_API_KEY_HERE' WITH YOUR ACTUAL KEY
 # I removed it for security since the previous one was posted publicly.
-API_KEY = 'rTQCNjitVG9Rs6LDYzuUVU4YbcpyVCA6mq2QSkPj8iTkxi3UBVbic+obsBlk7JCo' 
+API_KEY = 'zWXxr3Nsv7jw4tLSUzzwbKzoB2hENWolpCQPKrsYjZJM71FqMbmvUgtbJPNXFxL4' 
 YEAR = 2026 
 BASE_URL = 'https://api.collegebasketballdata.com'
 HEADERS = {'Authorization': f'Bearer {API_KEY}', 'accept': 'application/json'}
@@ -421,5 +421,6 @@ def run_analysis():
 
 if __name__ == "__main__":
     run_analysis()
+
 
 
